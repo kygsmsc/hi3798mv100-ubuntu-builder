@@ -6,11 +6,11 @@ on:
       usb_url:
         description: '原始 USB 刷机包下载地址'
         required: false
-        default: 'https://node4.histb.com:9088/update/system/mv100-mdmo1g-usb-flash.zip'
+        default: 'https://node4.histb.com:9088/update/system/mv100-mdmo1f-usb-flash.zip'
       base_version:
         description: 'Ubuntu Base 版本号（如 20.04.5 / 20.04.6）'
         required: false
-        default: '20.04.6'
+        default: '20.04.5'
       base_url:
         description: 'Ubuntu Base 下载目录'
         required: false
@@ -44,7 +44,7 @@ jobs:
     timeout-minutes: 60
 
     env:
-      USB_URL: ${{ inputs.usb_url || 'https://node4.histb.com:9088/update/system/mv100-mdmo1g-usb-flash.zip' }}
+      USB_URL: ${{ inputs.usb_url || 'https://node4.histb.com:9088/update/system/mv100-mdmo1f-usb-flash.zip' }}
       UBUNTU_VERSION: ${{ inputs.base_version }}
       BASE_URL: ${{ inputs.base_url }}
       MIRROR: ${{ inputs.mirror }}
@@ -107,7 +107,7 @@ jobs:
 
     - name: 8. 替换并重新打包
       run: |
-        FINAL_DIR="USB-hi3798mv100-mdmo1g-PURE"
+        FINAL_DIR="USB-hi3798mv100-mdmo1f-PURE"
         rm -rf "$FINAL_DIR"
         cp -r usb_template "$FINAL_DIR"
         rm -f "$FINAL_DIR/mv100/www_ecoo_top.ext4"
@@ -115,17 +115,17 @@ jobs:
         echo "刷机包内容:"
         ls -l "$FINAL_DIR/mv100/"
         cd "$FINAL_DIR"
-        zip -q -r "../USB-hi3798mv100-mdmo1g-PURE-$(date +%Y%m%d).zip" .
+        zip -q -r "../USB-hi3798mv100-mdmo1f-PURE-$(date +%Y%m%d).zip" .
         cd ..
         echo "✅ 最终刷机包:"
-        ls -lh USB-hi3798mv100-mdmo1g-PURE-*.zip
+        ls -lh USB-hi3798mv100-mdmo1f-PURE-*.zip
 
     - name: 9. 上传产物
       uses: actions/upload-artifact@v4
       with:
         name: pure-usb-package
         path: |
-          USB-hi3798mv100-mdmo1g-PURE-*.zip
+          USB-hi3798mv100-mdmo1f-PURE-*.zip
           usb-rootfs-pure.ext4
         retention-days: 7
         if-no-files-found: error
@@ -133,6 +133,6 @@ jobs:
     - name: 10. 清理
       if: always()
       run: |
-        sudo rm -rf usb_pure_rootfs temp_mount usb_template USB-hi3798mv100-mdmo1g-PURE 2>/dev/null || true
+        sudo rm -rf usb_pure_rootfs temp_mount usb_template USB-hi3798mv100-mdmo1f-PURE 2>/dev/null || true
         rm -f original_usb.zip original_system.ext4 usb-rootfs-pure.ext4 2>/dev/null || true
         echo "✅ 清理完成。"
