@@ -25,6 +25,24 @@ ROOT_PASSWORD="${ROOT_PASSWORD:-root123}"
 TIMEZONE="${TIMEZONE:-Asia/Shanghai}"
 LOCALES="${LOCALES:-en_US.UTF-8 zh_CN.UTF-8}"
 
+# ========== [修复] 根据版本号自动推导 Ubuntu 代号 ==========
+# 提取主版本号 (如 22.04.5 -> 22.04)，再映射到 codename
+VERSION_MAJOR="${UBUNTU_VERSION%.*.*}"
+# 如果上面的方式拿不到（如 "22.04"），再试一次
+if [[ "$VERSION_MAJOR" == *"."*"."* ]]; then
+  VERSION_MAJOR="${UBUNTU_VERSION%.*}"
+fi
+
+case "$VERSION_MAJOR" in
+  20.04) UBUNTU_CODENAME="focal" ;;
+  22.04) UBUNTU_CODENAME="jammy" ;;
+  24.04) UBUNTU_CODENAME="noble" ;;
+  *)     echo "⚠️  未知版本号 $UBUNTU_VERSION，默认使用 focal" >&2; UBUNTU_CODENAME="focal" ;;
+esac
+export UBUNTU_CODENAME
+
+echo "==> [common.sh] UBUNTU_VERSION=$UBUNTU_VERSION  =>  CODENAME=$UBUNTU_CODENAME"
+
 case "$MODE" in
   ttl) DEFAULT_ROOTFS_DIR="$(pwd)/pure_rootfs" ;;
   usb) DEFAULT_ROOTFS_DIR="$(pwd)/usb_pure_rootfs" ;;
@@ -115,6 +133,7 @@ run_inner() {
   $SUDO chroot "$ROOTFS_DIR" /usr/bin/env \
     MODE="$MODE" MIRROR="$MIRROR" HOSTNAME="$HOSTNAME" \
     ROOT_PASSWORD="$ROOT_PASSWORD" TIMEZONE="$TIMEZONE" LOCALES="$LOCALES" \
+    UBUNTU_CODENAME="$UBUNTU_CODENAME" \
     /bin/bash /tmp/rootfs_inner.sh
 }
 
