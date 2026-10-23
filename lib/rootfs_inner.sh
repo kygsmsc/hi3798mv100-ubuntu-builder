@@ -1,7 +1,7 @@
 #!/bin/bash
 # lib/rootfs_inner.sh — 在 chroot 内执行的系统配置脚本
 # 所需变量由 common.sh 通过 /usr/bin/env 传入：
-#   MODE MIRROR HOSTNAME ROOT_PASSWORD TIMEZONE LOCALES
+#   MODE MIRROR HOSTNAME ROOT_PASSWORD TIMEZONE LOCALES UBUNTU_CODENAME
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 export LC_ALL=C LANG=C
@@ -12,17 +12,26 @@ mount -t tmpfs tmpfs /tmp 2>/dev/null || true
 mkdir -p /var/cache/apt/archives
 mount -t tmpfs tmpfs /var/cache/apt/archives 2>/dev/null || true
 
-echo "==> 配置软件源: $MIRROR"
+# ========== [修复] 使用传入的 UBUNTU_CODENAME 变量，不再硬编码 focal ==========
+CODENAME="${UBUNTU_CODENAME:-focal}"
+echo "==> 使用 Ubuntu 代号: $CODENAME"
+echo "==> 配置软件源: $MIRROR ($CODENAME)"
+
 cat > /etc/apt/sources.list << SOURCES
-deb $MIRROR focal main restricted universe multiverse
-deb $MIRROR focal-updates main restricted universe multiverse
-deb $MIRROR focal-security main restricted universe multiverse
-deb $MIRROR focal-backports main restricted universe multiverse
+deb $MIRROR $CODENAME main restricted universe multiverse
+deb $MIRROR $CODENAME-updates main restricted universe multiverse
+deb $MIRROR $CODENAME-security main restricted universe multiverse
+deb $MIRROR $CODENAME-backports main restricted universe multiverse
 SOURCES
 
 echo "==> 更新软件源并安装核心软件包（--no-install-recommends 精简体积）"
 apt-get update -qq
-apt-get install -y -qq --no-install-recommends \
+
+# ========== [修复] 先尝试修复已有依赖问题，再安装 ==========
+apt-get -f install -y -qq 2>&1 || true
+
+# ========== [修复] 移除 --no-install-recommends 避免推荐依赖缺失导致安装失败 ==========
+apt-get install -y -qq \
   systemd systemd-sysv dbus udev \
   ifupdown iproute2 net-tools iputils-ping ethtool procps \
   openssh-server ssh sudo \
@@ -80,7 +89,8 @@ nameserver 223.6.6.6
 RESOLV
 
 echo "==> 深度清理"
-apt-get autoremove -y --purge
+# ========== [修复] 移除 --purge 避免误删关键包，仅 autoremove 不推荐的包 ==========
+apt-get autoremove -y
 apt-get clean
 rm -rf /var/lib/apt/lists/* /var/tmp/* /tmp/* /root/.cache 2>/dev/null || true
 rm -rf /usr/share/man /usr/share/info /usr/share/lintian /usr/share/linda 2>/dev/null || true
