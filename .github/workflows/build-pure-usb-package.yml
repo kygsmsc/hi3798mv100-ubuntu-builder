@@ -3,12 +3,15 @@ name: Build Pure USB Package
 on:
   workflow_dispatch:
     inputs:
-      usb_url:
-        description: '原始 USB 刷机包下载地址'
+      device_model:
+        description: '设备型号（如 mdmo1f），修改此项可全局变更设备标识'
         required: false
-        default: 'https://node4.histb.com:9088/update/system/mv100-mdmo1f-usb-flash.zip'
+        default: 'mdmo1f'
+      usb_url:
+        description: '原始 USB 刷机包下载地址（不填则根据 device_model 自动拼接）'
+        required: false
       base_version:
-        description: 'Ubuntu Base 版本号（如 20.04.5 / 20.04.6）'
+        description: 'Ubuntu Base 版本号（如 20.04.5 / 20.04.6），修改此项可全局变更 Ubuntu 版本'
         required: false
         default: '20.04.5'
       base_url:
@@ -44,7 +47,11 @@ jobs:
     timeout-minutes: 60
 
     env:
-      USB_URL: ${{ inputs.usb_url || 'https://node4.histb.com:9088/update/system/mv100-mdmo1f-usb-flash.zip' }}
+      # ========== 全局变量：设备型号 ==========
+      DEVICE_MODEL: ${{ inputs.device_model }}
+      # USB_URL 自动根据 device_model 拼接；也可通过 usb_url 输入手动覆盖
+      USB_URL: ${{ inputs.usb_url || format('https://node4.histb.com:9088/update/system/mv100-{0}-usb-flash.zip', inputs.device_model) }}
+      # ========== 全局变量：Ubuntu Base 版本号 ==========
       UBUNTU_VERSION: ${{ inputs.base_version }}
       BASE_URL: ${{ inputs.base_url }}
       MIRROR: ${{ inputs.mirror }}
@@ -82,7 +89,7 @@ jobs:
       uses: actions/cache@v4
       with:
         path: cache/ubuntu-base-*.tar.gz
-        key: ubuntu-base-${{ inputs.base_version || '22.04.5' }}
+        key: ubuntu-base-${{ env.UBUNTU_VERSION }}
 
     - name: 6. 构建纯净根文件系统
       run: |
@@ -107,7 +114,7 @@ jobs:
 
     - name: 8. 替换并重新打包
       run: |
-        FINAL_DIR="USB-hi3798mv100-mdmo1f-PURE"
+        FINAL_DIR="USB-hi3798mv100-${{ env.DEVICE_MODEL }}-PURE"
         rm -rf "$FINAL_DIR"
         cp -r usb_template "$FINAL_DIR"
         rm -f "$FINAL_DIR/mv100/www_ecoo_top.ext4"
@@ -115,17 +122,17 @@ jobs:
         echo "刷机包内容:"
         ls -l "$FINAL_DIR/mv100/"
         cd "$FINAL_DIR"
-        zip -q -r "../USB-hi3798mv100-mdmo1f-PURE-$(date +%Y%m%d).zip" .
+        zip -q -r "../USB-hi3798mv100-${{ env.DEVICE_MODEL }}-PURE-$(date +%Y%m%d).zip" .
         cd ..
         echo "✅ 最终刷机包:"
-        ls -lh USB-hi3798mv100-mdmo1f-PURE-*.zip
+        ls -lh USB-hi3798mv100-${{ env.DEVICE_MODEL }}-PURE-*.zip
 
     - name: 9. 上传产物
       uses: actions/upload-artifact@v4
       with:
         name: pure-usb-package
         path: |
-          USB-hi3798mv100-mdmo1f-PURE-*.zip
+          USB-hi3798mv100-${{ env.DEVICE_MODEL }}-PURE-*.zip
           usb-rootfs-pure.ext4
         retention-days: 7
         if-no-files-found: error
@@ -133,6 +140,6 @@ jobs:
     - name: 10. 清理
       if: always()
       run: |
-        sudo rm -rf usb_pure_rootfs temp_mount usb_template USB-hi3798mv100-mdmo1f-PURE 2>/dev/null || true
+        sudo rm -rf usb_pure_rootfs temp_mount usb_template USB-hi3798mv100-${{ env.DEVICE_MODEL }}-PURE 2>/dev/null || true
         rm -f original_usb.zip original_system.ext4 usb-rootfs-pure.ext4 2>/dev/null || true
         echo "✅ 清理完成。"
