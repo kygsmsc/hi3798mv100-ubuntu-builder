@@ -10,7 +10,7 @@ on:
       base_version:
         description: 'Ubuntu Base 版本号（如 20.04.5 / 20.04.6）'
         required: false
-        default: '20.04.5'
+        default: '20.04.6'
       base_url:
         description: 'Ubuntu Base 下载目录'
         required: false
