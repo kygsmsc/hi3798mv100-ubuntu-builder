@@ -100,9 +100,19 @@ jobs:
       run: |
         ORIG_SIZE=$(stat -c%s "original_system.ext4")
         echo "基于原始大小 ($ORIG_SIZE 字节) 创建镜像..."
+
+        # ========== 读取原始镜像的卷标，新镜像保持一致 ==========
+        ORIG_LABEL=$(sudo dumpe2fs -h original_system.ext4 2>/dev/null | grep -i "Filesystem volume name" | awk -F: '{print $2}' | xargs)
+        echo "原始镜像卷标: '${ORIG_LABEL}'"
+        if [ -z "$ORIG_LABEL" ]; then
+          echo "⚠️ 原始镜像无卷标，使用默认 pure_root"
+          ORIG_LABEL="pure_root"
+        fi
+
         PURE_IMG="usb-rootfs-pure.ext4"
         dd if=/dev/zero of="$PURE_IMG" bs=1 count=0 seek=$ORIG_SIZE status=progress
-        mkfs.ext4 -F -m 0 -L "pure_root" "$PURE_IMG"
+        mkfs.ext4 -F -m 0 -L "$ORIG_LABEL" "$PURE_IMG"
+        echo "✅ 新镜像卷标已设置为: ${ORIG_LABEL}"
         mkdir -p temp_mount
         sudo mount -o loop "$PURE_IMG" temp_mount
         sudo cp -a usb_pure_rootfs/. temp_mount/
