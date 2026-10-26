@@ -12,7 +12,7 @@ mount -t tmpfs tmpfs /tmp 2>/dev/null || true
 mkdir -p /var/cache/apt/archives
 mount -t tmpfs tmpfs /var/cache/apt/archives 2>/dev/null || true
 
-# ========== [修复] 使用传入的 UBUNTU_CODENAME 变量，不再硬编码 focal ==========
+# ========== [修复] 使用传入的 UBUNTU_CODENAME 变量，不再硬编码 focal ==========\
 CODENAME="${UBUNTU_CODENAME:-focal}"
 echo "==> 使用 Ubuntu 代号: $CODENAME"
 echo "==> 配置软件源: $MIRROR ($CODENAME)"
@@ -24,13 +24,13 @@ deb $MIRROR $CODENAME-security main restricted universe multiverse
 deb $MIRROR $CODENAME-backports main restricted universe multiverse
 SOURCES
 
-echo "==> 更新软件源并安装核心软件包（--no-install-recommends 精简体积）"
+echo "==> 更新软件源并安装核心软件包"
 apt-get update -qq
 
-# ========== [修复] 先尝试修复已有依赖问题，再安装 ==========
+# ========== [修复] 先尝试修复已有依赖问题，再安装 ==========\
 apt-get -f install -y -qq 2>&1 || true
 
-# ========== [修复] 移除 --no-install-recommends 避免推荐依赖缺失导致安装失败 ==========
+# ========== [修复] 不再使用 --no-install-recommends 参数（避免推荐依赖缺失导致安装失败） ==========\
 apt-get install -y -qq \
   systemd systemd-sysv dbus udev \
   ifupdown iproute2 net-tools iputils-ping ethtool procps \
@@ -79,7 +79,7 @@ cat > /root/.bashrc << 'BASHRC'
 alias ll='ls -alF'
 alias la='ls -A'
 alias l='ls -CF'
-PS1='\[\e[1;32m\]\u@\h\[\e[0m\]:\[\e[1;34m\]\w\[\e[0m\]\$ '
+PS1='\[\\e[1;32m\]\u@\h\[\\e[0m\]:\[\\e[1;34m\]\w\[\\e[0m\]\$ '
 BASHRC
 
 echo "==> DNS 兜底配置（DHCP 分配后会被覆盖）"
@@ -89,7 +89,7 @@ nameserver 223.6.6.6
 RESOLV
 
 echo "==> 深度清理"
-# ========== [修复] 移除 --purge 避免误删关键包，仅 autoremove 不推荐的包 ==========
+# ========== [修复] 移除 --purge 避免误删关键包，仅 autoremove 不推荐的包 ==========\
 apt-get autoremove -y
 apt-get clean
 rm -rf /var/lib/apt/lists/* /var/tmp/* /tmp/* /root/.cache 2>/dev/null || true
