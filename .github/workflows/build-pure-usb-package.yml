@@ -1,4 +1,4 @@
-name: Build Pure USB Package
+name: 编译Hi3798mv100的ubuntu系统USB刷机包
 
 on:
   workflow_dispatch:
@@ -39,7 +39,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build-usb-pure:
@@ -114,32 +114,144 @@ jobs:
 
     - name: 8. 替换并重新打包
       run: |
+        # 编译源标识：Ubuntu 版本号（即本刷机包的 rootfs 基础系统）
+        SOURCE_OS="Ubuntu_${{ env.UBUNTU_VERSION }}"
+        echo "编译源系统: ${SOURCE_OS}"
+
         FINAL_DIR="USB-hi3798mv100-${{ env.DEVICE_MODEL }}-PURE"
         rm -rf "$FINAL_DIR"
         cp -r usb_template "$FINAL_DIR"
         rm -f "$FINAL_DIR/mv100/www_ecoo_top.ext4"
         cp usb-rootfs-pure.ext4 "$FINAL_DIR/mv100/www_ecoo_top.ext4"
+
         echo "刷机包内容:"
         ls -l "$FINAL_DIR/mv100/"
-        cd "$FINAL_DIR"
-        zip -q -r "../USB-hi3798mv100-${{ env.DEVICE_MODEL }}-PURE-$(date +%Y%m%d).zip" .
-        cd ..
-        echo "✅ 最终刷机包:"
-        ls -lh USB-hi3798mv100-${{ env.DEVICE_MODEL }}-PURE-*.zip
 
-    - name: 9. 上传产物
+        # 刷机包 zip 文件名中加入编译源系统版本号
+        INNER_ZIP="USB-hi3798mv100-${{ env.DEVICE_MODEL }}-PURE-${SOURCE_OS}-$(date +%Y%m%d).zip"
+        cd "$FINAL_DIR"
+        zip -q -r "../${INNER_ZIP}" .
+        cd ..
+        echo "INNER_ZIP=${INNER_ZIP}" >> "$GITHUB_ENV"
+        echo "SOURCE_OS=${SOURCE_OS}" >> "$GITHUB_ENV"
+        echo "✅ 最终刷机包:"
+        ls -lh "${INNER_ZIP}"
+
+    - name: 9. 打包总包（含中文说明文档）
+      run: |
+        # 总包命名：Hi3798mv100_USB_设备型号_编译源系统版本号.zip
+        RELEASE_ZIP="Hi3798mv100_USB_${{ env.DEVICE_MODEL }}_${SOURCE_OS}.zip"
+
+        mkdir -p release_staging
+        # 将刷机包复制进总包
+        cp "${INNER_ZIP}" "release_staging/"
+        # 将纯 ext4 镜像也复制进总包（方便单独刷写）
+        cp usb-rootfs-pure.ext4 "release_staging/"
+
+        # ========== 生成中文说明文档 ==========
+        cat > "release_staging/刷机包说明.txt" << EOF
+        ================================================================
+          Hi3798MV100 USB 纯净刷机包 — 使用说明
+        ================================================================
+
+        【构建信息】
+          设备型号：      ${{ env.DEVICE_MODEL }}
+          编译源系统：    Ubuntu ${{ env.UBUNTU_VERSION }}
+          Ubuntu Base：   ${{ env.UBUNTU_VERSION }}
+          构建日期：      $(date '+%Y-%m-%d %H:%M:%S')
+
+        【root 账号信息】
+          用户名：        root
+          初始密码：      ${{ env.ROOT_PASSWORD }}
+          ⚠️ 首次登录后请立即执行 passwd root 修改密码！
+
+        ┌─────────────────────────────────────────────────┬────────────────────────────────────┐
+        │ 文件 / 目录                                     │ 说明                               │
+        ├─────────────────────────────────────────────────┼────────────────────────────────────┤
+        │ ${INNER_ZIP}                                    │ 完整刷机包（含 ext4 镜像和引导文件）│
+        │ usb-rootfs-pure.ext4                            │ 纯净根文件系统 ext4 镜像（备份）    │
+        │ 刷机包说明.txt                                   │ 本说明文档                         │
+        └─────────────────────────────────────────────────┴────────────────────────────────────┘
+
+        【刷机步骤】
+          1. 将刷机包 zip 解压到 U 盘根目录（U 盘须为 FAT32 格式）
+          2. 将 U 盘插入机顶盒 USB 口
+          3. 按住机身侧面 Recovery 按钮，接通电源
+          4. 等待进入刷机界面后松开按钮，自动开始刷机
+          5. 进度条走完后自动重启，首次启动较慢请耐心等待
+
+        【注意事项】
+          - 刷机前请确认设备型号与本包匹配，刷错型号可能导致变砖
+          - U 盘建议使用 USB 2.0 接口，部分设备不兼容 USB 3.0
+          - root 初始密码为：${{ env.ROOT_PASSWORD }}，请首次登录后立即修改
+          - 如遇问题请检查 U 盘格式是否为 FAT32
+
+        ================================================================
+        EOF
+        # 去掉 heredoc 的缩进前导空格
+        sed -i 's/^        //' "release_staging/刷机包说明.txt"
+
+        echo "说明文档预览:"
+        cat "release_staging/刷机包说明.txt"
+
+        # 打总包
+        cd release_staging
+        zip -q -r "../${RELEASE_ZIP}" .
+        cd ..
+        echo "RELEASE_ZIP=${RELEASE_ZIP}" >> "$GITHUB_ENV"
+        echo "✅ 总包:"
+        ls -lh "${RELEASE_ZIP}"
+
+    - name: 10. 上传 Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: pure-usb-package
+        name: Hi3798mv100_USB_${{ env.DEVICE_MODEL }}_${{ env.SOURCE_OS }}
         path: |
-          USB-hi3798mv100-${{ env.DEVICE_MODEL }}-PURE-*.zip
-          usb-rootfs-pure.ext4
+          Hi3798mv100_USB_${{ env.DEVICE_MODEL }}_${{ env.SOURCE_OS }}.zip
         retention-days: 7
         if-no-files-found: error
 
-    - name: 10. 清理
+    - name: 11. 上传到 GitHub Releases
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: v${{ github.run_number }}-${{ env.DEVICE_MODEL }}
+        name: "Hi3798MV100 USB 纯净刷机包 - ${{ env.DEVICE_MODEL }} (${{ env.SOURCE_OS }})"
+        body: |
+          ## Hi3798MV100 USB 纯净刷机包
+
+          | 项目 | 内容 |
+          |------|------|
+          | 设备型号 | `${{ env.DEVICE_MODEL }}` |
+          | 编译源系统 | `Ubuntu ${{ env.UBUNTU_VERSION }}` |
+          | Ubuntu Base 版本 | `${{ env.UBUNTU_VERSION }}` |
+          | root 初始密码 | `${{ env.ROOT_PASSWORD }}` |
+          | 构建时间 | ${{ github.event.head_commit.timestamp || 'workflow_dispatch' }} |
+          | 触发方式 | ${{ github.event_name }} |
+
+          ### 账号信息
+          - **用户名：** `root`
+          - **初始密码：** `${{ env.ROOT_PASSWORD }}`
+          - ⚠️ 首次登录后请立即执行 `passwd root` 修改密码！
+
+          ### 下载与使用
+          1. 下载 **Hi3798mv100_USB_${{ env.DEVICE_MODEL }}_${{ env.SOURCE_OS }}.zip**
+          2. 解压后将刷机包 zip 解压到 U 盘根目录（FAT32 格式）
+          3. U 盘插入机顶盒，按住 Recovery 键通电，等待自动刷机
+
+          ### 总包内文件说明
+          | 文件 | 说明 |
+          |------|------|
+          | USB-hi3798mv100-${{ env.DEVICE_MODEL }}-PURE-${{ env.SOURCE_OS }}-*.zip | 完整刷机包（含 ext4 镜像和引导文件） |
+          | usb-rootfs-pure.ext4 | 纯净根文件系统 ext4 镜像（备份） |
+          | 刷机包说明.txt | 详细刷机说明文档 |
+        files: |
+          Hi3798mv100_USB_${{ env.DEVICE_MODEL }}_${{ env.SOURCE_OS }}.zip
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: 12. 清理
       if: always()
       run: |
-        sudo rm -rf usb_pure_rootfs temp_mount usb_template USB-hi3798mv100-${{ env.DEVICE_MODEL }}-PURE 2>/dev/null || true
+        sudo rm -rf usb_pure_rootfs temp_mount usb_template USB-hi3798mv100-${{ env.DEVICE_MODEL }}-PURE release_staging 2>/dev/null || true
         rm -f original_usb.zip original_system.ext4 usb-rootfs-pure.ext4 2>/dev/null || true
         echo "✅ 清理完成。"
