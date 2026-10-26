@@ -25,23 +25,21 @@ ROOT_PASSWORD="${ROOT_PASSWORD:-root123}"
 TIMEZONE="${TIMEZONE:-Asia/Shanghai}"
 LOCALES="${LOCALES:-en_US.UTF-8 zh_CN.UTF-8}"
 
-# ========== [修复] 根据版本号自动推导 Ubuntu 代号 ==========
-# 提取主版本号 (如 22.04.5 -> 22.04)，再映射到 codename
-VERSION_MAJOR="${UBUNTU_VERSION%.*.*}"
-# 如果上面的方式拿不到（如 "22.04"），再试一次
-if [[ "$VERSION_MAJOR" == *"."*"."* ]]; then
-  VERSION_MAJOR="${UBUNTU_VERSION%.*}"
-fi
+# ========== [修复] 根据版本号自动推导 Ubuntu 代号 ==========\
+# 【关键修复】使用 cut 提取前两段（major.minor），例如 "22.04.5" -> "22.04"
+# 原始代码使用参数展开 %.*.* 会错误地只保留 "22" 而非 "22.04"
+# 导致 case 匹配不到 "22.04" 而走到默认分支返回 "focal"（错误！）
+UBUNTU_MAJOR_MINOR=$(echo "$UBUNTU_VERSION" | cut -d. -f1,2)
 
-case "$VERSION_MAJOR" in
+case "$UBUNTU_MAJOR_MINOR" in
   20.04) UBUNTU_CODENAME="focal" ;;
   22.04) UBUNTU_CODENAME="jammy" ;;
   24.04) UBUNTU_CODENAME="noble" ;;
-  *)     echo "⚠️  未知版本号 $UBUNTU_VERSION，默认使用 focal" >&2; UBUNTU_CODENAME="focal" ;;
+  *)     echo "⚠️  未知版本号 $UBUNTU_VERSION (解析为 $UBUNTU_MAJOR_MINOR)，默认使用 focal" >&2; UBUNTU_CODENAME="focal" ;;
 esac
 export UBUNTU_CODENAME
 
-echo "==> [common.sh] UBUNTU_VERSION=$UBUNTU_VERSION  =>  CODENAME=$UBUNTU_CODENAME"
+echo "==> [common.sh] UBUNTU_VERSION=$UBUNTU_VERSION  =>  MAJOR_MINOR=$UBUNTU_MAJOR_MINOR  =>  CODENAME=$UBUNTU_CODENAME"
 
 case "$MODE" in
   ttl) DEFAULT_ROOTFS_DIR="$(pwd)/pure_rootfs" ;;
