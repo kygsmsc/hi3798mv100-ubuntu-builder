@@ -13,11 +13,11 @@ on:
       base_version:
         description: 'Ubuntu Base 版本号（如 20.04.5 / 22.04.5），修改此项可全局变更 Ubuntu 版本'
         required: false
-        default: '22.04.5'
+        default: '20.04.5'
       base_url:
         description: 'Ubuntu Base 下载目录'
         required: false
-        default: 'https://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release'
+        default: 'https://cdimage.ubuntu.com/ubuntu-base/releases/20.04/release'
       mirror:
         description: 'apt 软件源镜像'
         required: false
@@ -47,12 +47,13 @@ jobs:
     timeout-minutes: 60
 
     env:
-      DEVICE_MODEL: ${{ inputs.device_model }}
-      USB_URL: ${{ inputs.usb_url || format('https://node4.histb.com:9088/update/system/mv100-{0}-usb-flash.zip', inputs.device_model) }}
-      UBUNTU_VERSION: ${{ inputs.base_version }}
-      BASE_URL: ${{ inputs.base_url }}
-      MIRROR: ${{ inputs.mirror }}
-      ROOT_PASSWORD: ${{ inputs.root_password }}
+      DEVICE_MODEL: ${{ inputs.device_model || 'mdmo1f' }}
+      USB_URL: ${{ inputs.usb_url || format('https://node4.histb.com:9088/update/system/mv100-{0}-usb-flash.zip', inputs.device_model || 'mdmo1f') }}
+      # 【关键】显式回退：push 触发时 inputs 为空，防止版本悄悄回退导致误刷旧系统
+      UBUNTU_VERSION: ${{ inputs.base_version || '20.04.5' }}
+      BASE_URL: ${{ inputs.base_url || 'https://cdimage.ubuntu.com/ubuntu-base/releases/20.04/release' }}
+      MIRROR: ${{ inputs.mirror || 'http://repo.huaweicloud.com/ubuntu-ports' }}
+      ROOT_PASSWORD: ${{ inputs.root_password || 'root123' }}
 
     steps:
     - name: 1. 检出代码
@@ -62,50 +63,47 @@ jobs:
       run: |
         wget --no-check-certificate -c --tries=5 --timeout=60 --waitretry=10 "$USB_URL" -O original_usb.zip
         ls -lh original_usb.zip
-        unzip -tq original_usb.zip >/dev/null || { echo "ERROR 原始包损坏"; exit 1; }
-        echo "原始包完整性 OK"
+        unzip -tq original_usb.zip >/dev/null || { echo "❌ 原始包损坏"; exit 1; }
+        echo "✅ 原始包完整性 OK"
 
-    - name: 3. 解压并分析原系统镜像
+    - name: 3. 解压并备份原系统文件（含格式检测）
       run: |
         rm -rf usb_template
         mkdir -p usb_template
         unzip -q original_usb.zip -d usb_template/
         echo "包内容:"
         ls -la usb_template/mv100/
-        test -f "usb_template/mv100/www_ecoo_top.ext4" || { echo "未找到 www_ecoo_top.ext4"; exit 1; }
+        test -f "usb_template/mv100/www_ecoo_top.ext4" && echo "✅ 找到 www_ecoo_top.ext4" || { echo "❌ 未找到 www_ecoo_top.ext4"; exit 1; }
         cp "usb_template/mv100/www_ecoo_top.ext4" original_system.ext4
-        MAGIC=$(xxd -l 4 -p "original_system.ext4" 2>/dev/null | tr -d '\n' | head -c 8)
-        FILE_SIZE=$(stat -c%s "original_system.ext4")
-        echo "原始文件物理大小: $FILE_SIZE 字节"
-        echo "文件头 magic: $MAGIC"
+        echo "✅ 已备份原系统文件:"
+        ls -lh original_system.ext4
+
+        # 检测原始镜像格式：Android sparse magic = 0xED26FF3A（小端 3a ff 26 ed）
+        MAGIC=$(xxd -p -l 4 original_system.ext4)
+        echo "原始镜像 magic: $MAGIC"
         if [ "$MAGIC" = "3aff26ed" ]; then
-          echo "原始镜像为 Android sparse 格式"
-          echo "ORIG_IS_SPARSE=true" >> "$GITHUB_ENV"
-          BLK_SZ=$(od -An -j12 -N4 -tu4 "original_system.ext4" | head -1 | tr -d ' ')
-          TOTAL_BLKS=$(od -An -j16 -N4 -tu4 "original_system.ext4" | head -1 | tr -d ' ')
-          VIRTUAL_SIZE=$(( BLK_SZ * TOTAL_BLKS ))
-          echo "sparse 虚拟大小: $VIRTUAL_SIZE 字节 ($(( VIRTUAL_SIZE / 1024 / 1024 )) MB)"
-          echo "VIRTUAL_SIZE=$VIRTUAL_SIZE" >> "$GITHUB_ENV"
+          echo "ℹ️ 原始镜像是 Android sparse 格式"
+          echo "ORIG_FORMAT=sparse" >> "$GITHUB_ENV"
         else
-          echo "原始镜像为普通 ext4 格式"
-          echo "ORIG_IS_SPARSE=false" >> "$GITHUB_ENV"
-          echo "VIRTUAL_SIZE=$FILE_SIZE" >> "$GITHUB_ENV"
+          echo "ℹ️ 原始镜像是普通 ext4 格式"
+          echo "ORIG_FORMAT=ext4" >> "$GITHUB_ENV"
         fi
+
+        # 获取原始镜像「解压后」的真实大小（决定新镜像尺寸的关键）
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq android-sdk-libsparse-utils
+        if [ "$ORIG_FORMAT" = "sparse" ]; then
+          simg2img original_system.ext4 original_system_raw.ext4
+        else
+          cp original_system.ext4 original_system_raw.ext4
+        fi
+        ORIG_SIZE=$(stat -c%s original_system_raw.ext4)
+        echo "原始解压后真实大小: $ORIG_SIZE 字节 ($((ORIG_SIZE/1024/1024)) MB)"
+        echo "ORIG_SIZE=$ORIG_SIZE" >> "$GITHUB_ENV"
 
     - name: 4. 安装依赖
       run: |
-        sudo apt-get update -qq
         sudo apt-get install -y -qq qemu-user-static e2fsprogs zip
-        sudo apt-get install -y -qq android-sdk-libsparse-utils 2>/dev/null || true
-        if command -v img2simg >/dev/null 2>&1; then
-          echo "img2simg 已安装"
-          echo "SPARSE_METHOD=img2simg" >> "$GITHUB_ENV"
-        else
-          echo "img2simg 不可用, 将使用 Python 备用方案"
-          echo "SPARSE_METHOD=python" >> "$GITHUB_ENV"
-          echo "aW1wb3J0IHN0cnVjdCwgc3lzLCBvcwoKU1BBUlNFX01BR0lDID0gMHhFRDI2RkYzQQpDSFVOS19SQVcgPSAweENBQzEKQ0hVTktfRE9OVF9DQVJFID0gMHhDQUMzCkJMT0NLX1NJWkUgPSA0MDk2ClNQQVJTRV9IRFJfU0laRSA9IDI4CkNIVU5LX0hEUl9TSVpFID0gMTIKCnNyYyA9IHN5cy5hcmd2WzFdCmRzdCA9IHNyYyArICcuc3BhcnNlJwoKd2l0aCBvcGVuKHNyYywgJ3JiJykgYXMgZjoKICAgIGRhdGEgPSBmLnJlYWQoKQoKdG90YWxfYmxvY2tzID0gbGVuKGRhdGEpIC8vIEJMT0NLX1NJWkUKY2h1bmtzID0gW10KaSA9IDAKd2hpbGUgaSA8IGxlbihkYXRhKToKICAgIGJsb2NrID0gZGF0YVtpOmkrQkxPQ0tfU0laRV0KICAgIGlmIGJsb2NrID09IGInXHgwMCcgKiBCTE9DS19TSVpFOgogICAgICAgIGNvdW50ID0gMAogICAgICAgIHdoaWxlIGkgPCBsZW4oZGF0YSk6CiAgICAgICAgICAgIGlmIGRhdGFbaTppK0JMT0NLX1NJWkVdID09IGInXHgwMCcgKiBCTE9DS19TSVpFOgogICAgICAgICAgICAgICAgY291bnQgKz0gMQogICAgICAgICAgICAgICAgaSArPSBCTE9DS19TSVpFCiAgICAgICAgICAgIGVsc2U6CiAgICAgICAgICAgICAgICBicmVhawogICAgICAgIGNodW5rcy5hcHBlbmQoKENIVU5LX0RPTlRfQ0FSRSwgY291bnQsIGInJykpCiAgICBlbHNlOgogICAgICAgIHJhdyA9IGInJwogICAgICAgIGNvdW50ID0gMAogICAgICAgIHdoaWxlIGkgPCBsZW4oZGF0YSk6CiAgICAgICAgICAgIGIgPSBkYXRhW2k6aStCTE9DS19TSVpFXQogICAgICAgICAgICBpZiBiICE9IGInXHgwMCcgKiBCTE9DS19TSVpFOgogICAgICAgICAgICAgICAgcmF3ICs9IGIKICAgICAgICAgICAgICAgIGNvdW50ICs9IDEKICAgICAgICAgICAgICAgIGkgKz0gQkxPQ0tfU0laRQogICAgICAgICAgICBlbHNlOgogICAgICAgICAgICAgICAgYnJlYWsKICAgICAgICBjaHVua3MuYXBwZW5kKChDSFVOS19SQVcsIGNvdW50LCByYXcpKQoKd2l0aCBvcGVuKGRzdCwgJ3diJykgYXMgZjoKICAgIGYud3JpdGUoc3RydWN0LnBhY2soJzxJSEhISElJaScsCiAgICAgICAgU1BBUlNFX01BR0lDLCAxLCAwLCBTUEFSU0VfSERSX1NJWkUsIENIVU5LX0hEUl9TSVpFLAogICAgICAgIEJMT0NLX1NJWkUsIHRvdGFsX2Jsb2NrcywgbGVuKGNodW5rcyksIDApKQogICAgZm9yIGN0LCBiYywgY2QgaW4gY2h1bmtzOgogICAgICAgIGYud3JpdGUoc3RydWN0LnBhY2soJzxISElJJywgY3QsIDAsIGJjLCBDSFVOS19IRFJfU0laRSArIGxlbihjZCkpKQogICAgICAgIGYud3JpdGUoY2QpCgpvcy5yZXBsYWNlKGRzdCwgc3JjKQpwcmludChmJ0NvbnZlcnRlZDoge2xlbihjaHVua3MpfSBjaHVua3MsIHt0b3RhbF9ibG9ja3N9IGJsb2NrcycpCg==" | base64 -d > /tmp/ext2simg.py
-          echo "Python sparse 转换脚本已就绪"
-        fi
 
     - name: 5. 缓存 Ubuntu Base 镜像
       uses: actions/cache@v4
@@ -118,79 +116,104 @@ jobs:
         chmod +x build_usb_rootfs.sh
         ./build_usb_rootfs.sh
 
-    - name: 7. 创建 ext4 镜像并转换为 sparse 格式
+    - name: 7. 创建纯净 ext4 镜像并按原始格式输出
       run: |
-        VIRTUAL_SIZE="${{ env.VIRTUAL_SIZE }}"
-        echo "使用虚拟大小创建 ext4: $VIRTUAL_SIZE 字节 ($(( VIRTUAL_SIZE / 1024 / 1024 )) MB)"
         PURE_IMG="usb-rootfs-pure.ext4"
-        dd if=/dev/zero of="$PURE_IMG" bs=1 count=0 seek=$VIRTUAL_SIZE status=progress
+        rm -f "$PURE_IMG"
+
+        # 按原始解压后大小创建镜像，保证输出 sparse 的 total size 与分区一致
+        dd if=/dev/zero of="$PURE_IMG" bs=1 count=0 seek=$ORIG_SIZE status=progress
         mkfs.ext4 -F -m 0 -L "pure_root" "$PURE_IMG"
+
         mkdir -p temp_mount
         sudo mount -o loop "$PURE_IMG" temp_mount
         sudo cp -a usb_pure_rootfs/. temp_mount/
         sync
         sudo umount temp_mount
         e2fsck -p -f "$PURE_IMG" || true
-        echo "ext4 镜像大小:"
-        ls -lh "$PURE_IMG"
-        if [ "${{ env.ORIG_IS_SPARSE }}" = "true" ]; then
-          echo "原始镜像为 sparse 格式, 执行转换..."
-          if [ "${{ env.SPARSE_METHOD }}" = "img2simg" ]; then
-            img2simg "$PURE_IMG" "${PURE_IMG}.sparse"
-            mv "${PURE_IMG}.sparse" "$PURE_IMG"
-            echo "已通过 img2simg 转换为 sparse 格式"
-          else
-            python3 /tmp/ext2simg.py "$PURE_IMG"
-            echo "已通过 Python 脚本转换为 sparse 格式"
-          fi
-          MAGIC=$(xxd -l 4 -p "$PURE_IMG" 2>/dev/null | tr -d '\n' | head -c 8)
-          if [ "$MAGIC" = "3aff26ed" ]; then
-            V_BLK=$(od -An -j12 -N4 -tu4 "$PURE_IMG" | head -1 | tr -d ' ')
-            V_BLKS=$(od -An -j16 -N4 -tu4 "$PURE_IMG" | head -1 | tr -d ' ')
-            V_SIZE=$(( V_BLK * V_BLKS ))
-            echo "sparse 验证通过: 虚拟大小 $V_SIZE 字节 ($(( V_SIZE / 1024 / 1024 )) MB)"
-            if [ "$V_SIZE" -eq "$VIRTUAL_SIZE" ]; then
-              echo "虚拟大小与分区匹配"
-            else
-              echo "虚拟大小不匹配! sparse=$V_SIZE 期望=$VIRTUAL_SIZE"
-              exit 1
-            fi
-          else
-            echo "sparse 转换失败 (magic: $MAGIC)"
-            exit 1
-          fi
+
+        # 按原始格式决定输出格式
+        if [ "$ORIG_FORMAT" = "sparse" ]; then
+          img2simg "$PURE_IMG" "usb-rootfs-pure-final.img"
+          echo "✅ 已转为 Android sparse 格式"
+        else
+          cp "$PURE_IMG" "usb-rootfs-pure-final.img"
+          echo "ℹ️ 保持普通 ext4 格式"
         fi
-        echo "最终镜像:"
-        ls -lh "$PURE_IMG"
+
+        echo "输出镜像 magic:"
+        xxd -l 4 "usb-rootfs-pure-final.img"
+        ls -lh "usb-rootfs-pure-final.img"
 
     - name: 8. 替换并重新打包
       run: |
         SOURCE_OS="Ubuntu_${{ env.UBUNTU_VERSION }}"
+        echo "编译源系统: ${SOURCE_OS}"
+
         FINAL_DIR="USB-hi3798mv100-${{ env.DEVICE_MODEL }}-PURE"
         rm -rf "$FINAL_DIR"
         cp -r usb_template "$FINAL_DIR"
         rm -f "$FINAL_DIR/mv100/www_ecoo_top.ext4"
-        cp usb-rootfs-pure.ext4 "$FINAL_DIR/mv100/www_ecoo_top.ext4"
+        cp usb-rootfs-pure-final.img "$FINAL_DIR/mv100/www_ecoo_top.ext4"
+
+        echo "刷机包内容:"
+        ls -l "$FINAL_DIR/mv100/"
+
         INNER_ZIP="USB-hi3798mv100-${{ env.DEVICE_MODEL }}-PURE-${SOURCE_OS}-$(date +%Y%m%d).zip"
         cd "$FINAL_DIR"
         zip -q -r "../${INNER_ZIP}" .
         cd ..
         echo "INNER_ZIP=${INNER_ZIP}" >> "$GITHUB_ENV"
         echo "SOURCE_OS=${SOURCE_OS}" >> "$GITHUB_ENV"
-        echo "最终刷机包:"
+        echo "✅ 最终刷机包:"
         ls -lh "${INNER_ZIP}"
 
-    - name: 9. 打包总包
+    - name: 9. 打包总包（含中文说明文档）
       run: |
         RELEASE_ZIP="Hi3798mv100_USB_${{ env.DEVICE_MODEL }}_${SOURCE_OS}.zip"
         mkdir -p release_staging
         cp "${INNER_ZIP}" "release_staging/"
-        cp usb-rootfs-pure.ext4 "release_staging/"
+        cp usb-rootfs-pure-final.img "release_staging/www_ecoo_top.ext4"
+
+        cat > "release_staging/刷机包说明.txt" << EOF
+        ================================================================
+          Hi3798MV100 USB 纯净刷机包 — 使用说明
+        ================================================================
+
+        【构建信息】
+          设备型号：      ${{ env.DEVICE_MODEL }}
+          编译源系统：    Ubuntu ${{ env.UBUNTU_VERSION }}
+          Ubuntu Base：   ${{ env.UBUNTU_VERSION }}
+          原始镜像格式：  ${ORIG_FORMAT}
+          输出镜像格式：  ${ORIG_FORMAT}
+          构建日期：      $(date '+%Y-%m-%d %H:%M:%S')
+
+        【root 账号信息】
+          用户名：        root
+          初始密码：      ${{ env.ROOT_PASSWORD }}
+          ⚠️ 首次登录后请立即执行 passwd root 修改密码！
+
+        【刷机步骤】
+          1. 将刷机包 zip 解压到 U 盘根目录（U 盘须为 FAT32 格式）
+          2. 将 U 盘插入机顶盒 USB 口
+          3. 按住机身侧面 Recovery 按钮，接通电源
+          4. 等待进入刷机界面后松开按钮，自动开始刷机
+          5. 进度条走完后自动重启，首次启动较慢请耐心等待
+
+        【注意事项】
+          - 刷机前请确认设备型号与本包匹配，刷错型号可能导致变砖
+          - U 盘建议使用 USB 2.0 接口，部分设备不兼容 USB 3.0
+          - 如遇 "Invalid sparse format" 说明镜像格式错误，请勿使用
+
+        ================================================================
+        EOF
+        sed -i 's/^        //' "release_staging/刷机包说明.txt"
+
         cd release_staging
         zip -q -r "../${RELEASE_ZIP}" .
         cd ..
         echo "RELEASE_ZIP=${RELEASE_ZIP}" >> "$GITHUB_ENV"
-        echo "总包:"
+        echo "✅ 总包:"
         ls -lh "${RELEASE_ZIP}"
 
     - name: 10. 上传 Artifact
@@ -206,7 +229,7 @@ jobs:
       uses: softprops/action-gh-release@v2
       with:
         tag_name: v${{ github.run_number }}-${{ env.DEVICE_MODEL }}
-        name: "Hi3798MV100 USB - ${{ env.DEVICE_MODEL }} (${{ env.SOURCE_OS }})"
+        name: "Hi3798MV100 USB 纯净刷机包 - ${{ env.DEVICE_MODEL }} (${{ env.SOURCE_OS }})"
         body: |
           ## Hi3798MV100 USB 纯净刷机包
 
@@ -215,6 +238,15 @@ jobs:
           | 设备型号 | `${{ env.DEVICE_MODEL }}` |
           | 编译源系统 | `Ubuntu ${{ env.UBUNTU_VERSION }}` |
           | root 初始密码 | `${{ env.ROOT_PASSWORD }}` |
+
+          ### 账号信息
+          - **用户名：** `root`
+          - **初始密码：** `${{ env.ROOT_PASSWORD }}`
+
+          ### 下载与使用
+          1. 下载 **Hi3798mv100_USB_${{ env.DEVICE_MODEL }}_${{ env.SOURCE_OS }}.zip**
+          2. 解压后将刷机包 zip 解压到 U 盘根目录（FAT32 格式）
+          3. U 盘插入机顶盒，按住 Recovery 键通电，等待自动刷机
         files: |
           Hi3798mv100_USB_${{ env.DEVICE_MODEL }}_${{ env.SOURCE_OS }}.zip
       env:
@@ -224,5 +256,5 @@ jobs:
       if: always()
       run: |
         sudo rm -rf usb_pure_rootfs temp_mount usb_template USB-hi3798mv100-${{ env.DEVICE_MODEL }}-PURE release_staging 2>/dev/null || true
-        rm -f original_usb.zip original_system.ext4 usb-rootfs-pure.ext4 /tmp/ext2simg.py 2>/dev/null || true
-        echo "清理完成。"
+        rm -f original_usb.zip original_system.ext4 original_system_raw.ext4 usb-rootfs-pure*.img 2>/dev/null || true
+        echo "✅ 清理完成。"
