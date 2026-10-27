@@ -47,11 +47,8 @@ jobs:
     timeout-minutes: 60
 
     env:
-      # ========== 全局变量：设备型号 ==========
       DEVICE_MODEL: ${{ inputs.device_model }}
-      # USB_URL 自动根据 device_model 拼接；也可通过 usb_url 输入手动覆盖
       USB_URL: ${{ inputs.usb_url || format('https://node4.histb.com:9088/update/system/mv100-{0}-usb-flash.zip', inputs.device_model) }}
-      # ========== 全局变量：Ubuntu Base 版本号 ==========
       UBUNTU_VERSION: ${{ inputs.base_version }}
       BASE_URL: ${{ inputs.base_url }}
       MIRROR: ${{ inputs.mirror }}
@@ -68,7 +65,7 @@ jobs:
         unzip -tq original_usb.zip >/dev/null || { echo "❌ 原始包损坏"; exit 1; }
         echo "✅ 原始包完整性 OK"
 
-    - name: 3. 解压并备份原系统文件
+    - name: 3. 解压并分析原系统镜像
       run: |
         rm -rf usb_template
         mkdir -p usb_template
@@ -80,41 +77,59 @@ jobs:
         echo "✅ 已备份原系统文件:"
         ls -lh original_system.ext4
 
-        # ========== 检测原始镜像是否为 sparse 格式 ==========
-        MAGIC=$(xxd -l 4 -p "original_system.ext4" 2>/dev/null | head -c 8 || echo "")
+        # ========== 检测原始镜像格式并提取虚拟大小 ==========
+        MAGIC=$(xxd -l 4 -p "original_system.ext4" 2>/dev/null | tr -d '\n' | head -c 8)
+        FILE_SIZE=$(stat -c%s "original_system.ext4")
+        echo "原始文件物理大小: $FILE_SIZE 字节"
+        echo "文件头 magic: $MAGIC"
+
         if [ "$MAGIC" = "3aff26ed" ]; then
-          echo "✅ 原始镜像为 Android sparse 格式，后续需要转换"
+          echo "✅ 原始镜像为 Android sparse 格式"
           echo "ORIG_IS_SPARSE=true" >> "$GITHUB_ENV"
+
+          # 从 sparse header 提取虚拟大小
+          # sparse header 结构:
+          #   offset 0x0C: blk_sz (4 bytes, little-endian)
+          #   offset 0x10: total_blks (4 bytes, little-endian)
+          #   virtual_size = blk_sz * total_blks
+          BLOCK_SIZE=$(python3 -c "
+          import struct
+          with open('original_system.ext4', 'rb') as f:
+              f.seek(0x0C)
+              blk_sz = struct.unpack('<I', f.read(4))[0]
+              total_blks = struct.unpack('<I', f.read(4))[0]
+              virtual_size = blk_sz * total_blks
+              print(f'{blk_sz} {total_blks} {virtual_size}')
+          ")
+          echo "sparse header 解析结果: $BLOCK_SIZE"
+          BLK_SZ=$(echo "$BLOCK_SIZE" | awk '{print $1}')
+          TOTAL_BLKS=$(echo "$BLOCK_SIZE" | awk '{print $2}')
+          VIRTUAL_SIZE=$(echo "$BLOCK_SIZE" | awk '{print $3}')
+          echo "  块大小: $BLK_SZ 字节"
+          echo "  总块数: $TOTAL_BLKS"
+          echo "  虚拟大小: $VIRTUAL_SIZE 字节 ($(( VIRTUAL_SIZE / 1024 / 1024 )) MB)"
+          echo "VIRTUAL_SIZE=$VIRTUAL_SIZE" >> "$GITHUB_ENV"
         else
           echo "ℹ️  原始镜像为普通 ext4 格式"
           echo "ORIG_IS_SPARSE=false" >> "$GITHUB_ENV"
+          echo "VIRTUAL_SIZE=$FILE_SIZE" >> "$GITHUB_ENV"
         fi
 
     - name: 4. 安装依赖
       run: |
         sudo apt-get update -qq
-        sudo apt-get install -y -qq qemu-user-static e2fsprogs zip xxd
-        # 安装 img2simg 工具（用于将普通 ext4 转换为 Android sparse 格式）
-        sudo apt-get install -y -qq android-sdk-libsparse-utils 2>/dev/null || {
-          echo "⚠️  android-sdk-libsparse-utils 不可用，尝试从源码编译 img2simg..."
-          sudo apt-get install -y -qq build-essential
-          cd /tmp
-          git clone --depth 1 https://github.com/nicholasgasior/android-tools.git android-tools-src 2>/dev/null || {
-            # 备用方案：直接用 Python 脚本做 sparse 转换
-            echo "⚠️  源码编译也失败，将使用 Python 备用方案"
-          }
-          cd -
-        }
-        # 验证 img2simg 是否可用
+        sudo apt-get install -y -qq qemu-user-static e2fsprogs zip
+        # 安装 img2simg（普通 ext4 → Android sparse 转换）
+        sudo apt-get install -y -qq android-sdk-libsparse-utils 2>/dev/null || true
         if command -v img2simg >/dev/null 2>&1; then
           echo "✅ img2simg 已安装"
           echo "SPARSE_METHOD=img2simg" >> "$GITHUB_ENV"
         else
-          echo "ℹ️  将使用 Python 备用方案进行 sparse 转换"
+          echo "ℹ️  img2simg 不可用，将使用 Python 备用方案"
           echo "SPARSE_METHOD=python" >> "$GITHUB_ENV"
         fi
 
-    - name: 5. 缓存 Ubuntu Base 镜像（版本固定，可安全复用）
+    - name: 5. 缓存 Ubuntu Base 镜像
       uses: actions/cache@v4
       with:
         path: cache/ubuntu-base-*.tar.gz
@@ -125,12 +140,18 @@ jobs:
         chmod +x build_usb_rootfs.sh
         ./build_usb_rootfs.sh
 
-    - name: 7. 创建纯净 ext4 镜像并转换为 sparse 格式
+    - name: 7. 创建 ext4 镜像并转换为 sparse 格式
       run: |
-        ORIG_SIZE=$(stat -c%s "original_system.ext4")
-        echo "基于原始大小 ($ORIG_SIZE 字节) 创建镜像..."
+        VIRTUAL_SIZE="${{ env.VIRTUAL_SIZE }}"
+        echo "=============================================="
+        echo "使用虚拟大小创建 ext4: $VIRTUAL_SIZE 字节 ($(( VIRTUAL_SIZE / 1024 / 1024 )) MB)"
+        echo "=============================================="
+
         PURE_IMG="usb-rootfs-pure.ext4"
-        dd if=/dev/zero of="$PURE_IMG" bs=1 count=0 seek=$ORIG_SIZE status=progress
+
+        # 【关键修复】使用虚拟大小（而非文件物理大小）创建 ext4
+        # 这样 sparse 转换后的 total_blocks 才能匹配设备分区大小
+        dd if=/dev/zero of="$PURE_IMG" bs=1 count=0 seek=$VIRTUAL_SIZE status=progress
         mkfs.ext4 -F -m 0 -L "pure_root" "$PURE_IMG"
         mkdir -p temp_mount
         sudo mount -o loop "$PURE_IMG" temp_mount
@@ -139,12 +160,10 @@ jobs:
         sudo umount temp_mount
         e2fsck -p -f "$PURE_IMG" || true
 
-        echo "普通 ext4 镜像大小:"
+        echo "ext4 镜像大小（与分区匹配）:"
         ls -lh "$PURE_IMG"
 
         # ========== 转换为 Android sparse 格式 ==========
-        # hi3798mv100 的 fastboot 使用 "MMC write ext4 sparse" 写入
-        # 必须将普通 ext4 转换为 sparse 格式，否则刷机时出现 "Invalid sparse format" 错误
         if [ "${{ env.ORIG_IS_SPARSE }}" = "true" ]; then
           echo "原始镜像为 sparse 格式，执行转换..."
 
@@ -153,30 +172,18 @@ jobs:
             mv "${PURE_IMG}.sparse" "$PURE_IMG"
             echo "✅ 已通过 img2simg 转换为 sparse 格式"
           else
-            # Python 备用方案：使用 img2simg 的 Python 实现
-            pip install img2simg 2>/dev/null && {
-              python3 -c "
-        import img2simg
-        img2simg.main(['$PURE_IMG', '${PURE_IMG}.sparse'])
-        " && {
-                mv "${PURE_IMG}.sparse" "$PURE_IMG"
-                echo "✅ 已通过 Python img2simg 转换为 sparse 格式"
-              }
-            } || {
-              # 最终备用方案：手动实现最简 sparse 转换
-              echo "⚠️  自动转换工具不可用，使用手动 sparse 脚本..."
-              python3 << 'PYSPARSE'
-        import struct, sys, os
+            echo "使用 Python 备用方案转换..."
+            python3 << 'PYSPARSE'
+        import struct, os
 
-        CHUNK_TYPE_RAW = 0xCAC1
-        CHUNK_TYPE_FILL = 0xCAC2
-        CHUNK_TYPE_DONT_CARE = 0xCAC3
-        SPARSE_HEADER_MAGIC = 0xED26FF3A
-        SPARSE_HEADER_SIZE = 28
-        CHUNK_HEADER_SIZE = 12
+        SPARSE_MAGIC = 0xED26FF3A
+        CHUNK_RAW = 0xCAC1
+        CHUNK_DONT_CARE = 0xCAC3
         BLOCK_SIZE = 4096
+        SPARSE_HDR_SIZE = 28
+        CHUNK_HDR_SIZE = 12
 
-        src = sys.argv[1] if len(sys.argv) > 1 else "usb-rootfs-pure.ext4"
+        src = "usb-rootfs-pure.ext4"
         dst = src + ".sparse"
 
         with open(src, 'rb') as f:
@@ -187,56 +194,60 @@ jobs:
         i = 0
         while i < len(data):
             block = data[i:i+BLOCK_SIZE]
-            # 检查是否全零
             if block == b'\x00' * BLOCK_SIZE:
-                # 连续零块合并为 DONT_CARE
                 count = 0
                 while i < len(data):
-                    b = data[i:i+BLOCK_SIZE]
-                    if b == b'\x00' * BLOCK_SIZE:
+                    if data[i:i+BLOCK_SIZE] == b'\x00' * BLOCK_SIZE:
                         count += 1
                         i += BLOCK_SIZE
                     else:
                         break
-                chunks.append((CHUNK_TYPE_DONT_CARE, count, b''))
+                chunks.append((CHUNK_DONT_CARE, count, b''))
             else:
-                # 非零数据块合并为 RAW
-                raw_data = b''
+                raw = b''
                 count = 0
                 while i < len(data):
                     b = data[i:i+BLOCK_SIZE]
                     if b != b'\x00' * BLOCK_SIZE:
-                        raw_data += b
+                        raw += b
                         count += 1
                         i += BLOCK_SIZE
                     else:
                         break
-                chunks.append((CHUNK_TYPE_RAW, count, raw_data))
+                chunks.append((CHUNK_RAW, count, raw))
 
         with open(dst, 'wb') as f:
-            # Sparse header
-            f.write(struct.pack('<I', SPARSE_HEADER_MAGIC))
-            f.write(struct.pack('<HH', 1, 0))  # major, minor
-            f.write(struct.pack('<H', 16))     # file header size
-            f.write(struct.pack('<H', CHUNK_HEADER_SIZE))
-            f.write(struct.pack('<I', BLOCK_SIZE))
-            f.write(struct.pack('<I', total_blocks))
-            f.write(struct.pack('<I', len(chunks)))
-            f.write(struct.pack('<I', 0))  # crc
-
-            for chunk_type, block_count, chunk_data in chunks:
-                total_sz = CHUNK_HEADER_SIZE + len(chunk_data)
-                f.write(struct.pack('<HHII', chunk_type, 0, block_count, total_sz))
-                f.write(chunk_data)
+            f.write(struct.pack('<IHHHHIIi',
+                SPARSE_MAGIC, 1, 0, SPARSE_HDR_SIZE, CHUNK_HDR_SIZE,
+                BLOCK_SIZE, total_blocks, len(chunks), 0))
+            for ct, bc, cd in chunks:
+                f.write(struct.pack('<HHII', ct, 0, bc, CHUNK_HDR_SIZE + len(cd)))
+                f.write(cd)
 
         os.replace(dst, src)
-        print(f"✅ 已通过 Python 手动脚本转换为 sparse 格式")
+        print(f"✅ Python sparse 转换完成 ({len(chunks)} chunks, {total_blocks} blocks)")
         PYSPARSE
-              python3 - "$PURE_IMG" << 'PYSPARSE2'
-        # 如果上面的内联脚本没执行到，这里做兜底
-        pass
-        PYSPARSE2
-            }
+          fi
+
+          # 验证 sparse 格式
+          MAGIC=$(xxd -l 4 -p "$PURE_IMG" 2>/dev/null | tr -d '\n' | head -c 8)
+          if [ "$MAGIC" = "3aff26ed" ]; then
+            echo "✅ sparse 格式验证通过 (magic: 0xED26FF3A)"
+            # 验证虚拟大小
+            python3 -c "
+        import struct
+        with open('$PURE_IMG', 'rb') as f:
+            f.seek(0x0C)
+            blk = struct.unpack('<I', f.read(4))[0]
+            blks = struct.unpack('<I', f.read(4))[0]
+            vs = blk * blks
+            print(f'sparse 虚拟大小: {vs} 字节 ({vs // 1024 // 1024} MB)')
+            assert vs == $VIRTUAL_SIZE, f'虚拟大小不匹配! sparse={vs} 期望=$VIRTUAL_SIZE'
+            print('✅ 虚拟大小与分区匹配')
+        "
+          else
+            echo "❌ sparse 转换失败 (magic: $MAGIC)"
+            exit 1
           fi
         else
           echo "ℹ️  原始镜像不是 sparse 格式，跳过转换"
@@ -245,18 +256,8 @@ jobs:
         echo "✅ 最终镜像:"
         ls -lh "$PURE_IMG"
 
-        # 验证 sparse 格式
-        MAGIC=$(xxd -l 4 -p "$PURE_IMG" 2>/dev/null | head -c 8 || echo "")
-        if [ "$MAGIC" = "3aff26ed" ]; then
-          echo "✅ sparse 格式验证通过 (magic: 0xED26FF3A)"
-        elif [ "${{ env.ORIG_IS_SPARSE }}" = "true" ]; then
-          echo "❌ sparse 转换可能失败，请检查 CI 日志"
-          exit 1
-        fi
-
     - name: 8. 替换并重新打包
       run: |
-        # 编译源标识：Ubuntu 版本号（即本刷机包的 rootfs 基础系统）
         SOURCE_OS="Ubuntu_${{ env.UBUNTU_VERSION }}"
         echo "编译源系统: ${SOURCE_OS}"
 
@@ -269,7 +270,6 @@ jobs:
         echo "刷机包内容:"
         ls -l "$FINAL_DIR/mv100/"
 
-        # 刷机包 zip 文件名中加入编译源系统版本号
         INNER_ZIP="USB-hi3798mv100-${{ env.DEVICE_MODEL }}-PURE-${SOURCE_OS}-$(date +%Y%m%d).zip"
         cd "$FINAL_DIR"
         zip -q -r "../${INNER_ZIP}" .
@@ -281,16 +281,12 @@ jobs:
 
     - name: 9. 打包总包（含中文说明文档）
       run: |
-        # 总包命名：Hi3798mv100_USB_设备型号_编译源系统版本号.zip
         RELEASE_ZIP="Hi3798mv100_USB_${{ env.DEVICE_MODEL }}_${SOURCE_OS}.zip"
 
         mkdir -p release_staging
-        # 将刷机包复制进总包
         cp "${INNER_ZIP}" "release_staging/"
-        # 将纯 ext4 镜像也复制进总包（方便单独刷写）
         cp usb-rootfs-pure.ext4 "release_staging/"
 
-        # ========== 生成中文说明文档 ==========
         cat > "release_staging/刷机包说明.txt" << EOF
         ================================================================
           Hi3798MV100 USB 纯净刷机包 — 使用说明
@@ -307,14 +303,6 @@ jobs:
           初始密码：      ${{ env.ROOT_PASSWORD }}
           ⚠️ 首次登录后请立即执行 passwd root 修改密码！
 
-        ┌─────────────────────────────────────────────────┬────────────────────────────────────┐
-        │ 文件 / 目录                                     │ 说明                               │
-        ├─────────────────────────────────────────────────┼────────────────────────────────────┤
-        │ ${INNER_ZIP}                                    │ 完整刷机包（含 ext4 镜像和引导文件）│
-        │ usb-rootfs-pure.ext4                            │ 纯净根文件系统 ext4 镜像（备份）    │
-        │ 刷机包说明.txt                                   │ 本说明文档                         │
-        └─────────────────────────────────────────────────┴────────────────────────────────────┘
-
         【刷机步骤】
           1. 将刷机包 zip 解压到 U 盘根目录（U 盘须为 FAT32 格式）
           2. 将 U 盘插入机顶盒 USB 口
@@ -323,20 +311,17 @@ jobs:
           5. 进度条走完后自动重启，首次启动较慢请耐心等待
 
         【注意事项】
-          - 刷机前请确认设备型号与本包匹配，刷错型号可能导致变砖
-          - U 盘建议使用 USB 2.0 接口，部分设备不兼容 USB 3.0
+          - 刷机前请确认设备型号与本包匹配
+          - U 盘建议使用 USB 2.0 接口
           - root 初始密码为：${{ env.ROOT_PASSWORD }}，请首次登录后立即修改
-          - 如遇问题请检查 U 盘格式是否为 FAT32
 
         ================================================================
         EOF
-        # 去掉 heredoc 的缩进前导空格
         sed -i 's/^        //' "release_staging/刷机包说明.txt"
 
         echo "说明文档预览:"
         cat "release_staging/刷机包说明.txt"
 
-        # 打总包
         cd release_staging
         zip -q -r "../${RELEASE_ZIP}" .
         cd ..
@@ -365,27 +350,13 @@ jobs:
           |------|------|
           | 设备型号 | `${{ env.DEVICE_MODEL }}` |
           | 编译源系统 | `Ubuntu ${{ env.UBUNTU_VERSION }}` |
-          | Ubuntu Base 版本 | `${{ env.UBUNTU_VERSION }}` |
           | root 初始密码 | `${{ env.ROOT_PASSWORD }}` |
           | 构建时间 | ${{ github.event.head_commit.timestamp || 'workflow_dispatch' }} |
-          | 触发方式 | ${{ github.event_name }} |
 
           ### 账号信息
           - **用户名：** `root`
           - **初始密码：** `${{ env.ROOT_PASSWORD }}`
           - ⚠️ 首次登录后请立即执行 `passwd root` 修改密码！
-
-          ### 下载与使用
-          1. 下载 **Hi3798mv100_USB_${{ env.DEVICE_MODEL }}_${{ env.SOURCE_OS }}.zip**
-          2. 解压后将刷机包 zip 解压到 U 盘根目录（FAT32 格式）
-          3. U 盘插入机顶盒，按住 Recovery 键通电，等待自动刷机
-
-          ### 总包内文件说明
-          | 文件 | 说明 |
-          |------|------|
-          | USB-hi3798mv100-${{ env.DEVICE_MODEL }}-PURE-${{ env.SOURCE_OS }}-*.zip | 完整刷机包（含 ext4 镜像和引导文件） |
-          | usb-rootfs-pure.ext4 | 纯净根文件系统 ext4 镜像（备份） |
-          | 刷机包说明.txt | 详细刷机说明文档 |
         files: |
           Hi3798mv100_USB_${{ env.DEVICE_MODEL }}_${{ env.SOURCE_OS }}.zip
       env:
