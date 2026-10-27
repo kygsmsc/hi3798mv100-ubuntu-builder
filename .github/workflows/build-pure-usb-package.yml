@@ -88,19 +88,17 @@ jobs:
           echo "ORIG_IS_SPARSE=true" >> "$GITHUB_ENV"
 
           # 从 sparse header 提取虚拟大小
-          # sparse header 结构:
-          #   offset 0x0C: blk_sz (4 bytes, little-endian)
-          #   offset 0x10: total_blks (4 bytes, little-endian)
-          #   virtual_size = blk_sz * total_blks
-          BLOCK_SIZE=$(python3 -c "
-          import struct
-          with open('original_system.ext4', 'rb') as f:
-              f.seek(0x0C)
-              blk_sz = struct.unpack('<I', f.read(4))[0]
-              total_blks = struct.unpack('<I', f.read(4))[0]
-              virtual_size = blk_sz * total_blks
-              print(f'{blk_sz} {total_blks} {virtual_size}')
-          ")
+          # sparse header: offset 0x0C = blk_sz(4B LE), offset 0x10 = total_blks(4B LE)
+          cat > /tmp/read_sparse.py << 'PYEOF'
+import struct, sys
+with open(sys.argv[1], 'rb') as f:
+    f.seek(0x0C)
+    blk_sz = struct.unpack('<I', f.read(4))[0]
+    total_blks = struct.unpack('<I', f.read(4))[0]
+    virtual_size = blk_sz * total_blks
+    print(f'{blk_sz} {total_blks} {virtual_size}')
+PYEOF
+          BLOCK_SIZE=$(python3 /tmp/read_sparse.py "original_system.ext4")
           echo "sparse header 解析结果: $BLOCK_SIZE"
           BLK_SZ=$(echo "$BLOCK_SIZE" | awk '{print $1}')
           TOTAL_BLKS=$(echo "$BLOCK_SIZE" | awk '{print $2}')
@@ -234,17 +232,20 @@ jobs:
           if [ "$MAGIC" = "3aff26ed" ]; then
             echo "✅ sparse 格式验证通过 (magic: 0xED26FF3A)"
             # 验证虚拟大小
-            python3 -c "
-        import struct
-        with open('$PURE_IMG', 'rb') as f:
-            f.seek(0x0C)
-            blk = struct.unpack('<I', f.read(4))[0]
-            blks = struct.unpack('<I', f.read(4))[0]
-            vs = blk * blks
-            print(f'sparse 虚拟大小: {vs} 字节 ({vs // 1024 // 1024} MB)')
-            assert vs == $VIRTUAL_SIZE, f'虚拟大小不匹配! sparse={vs} 期望=$VIRTUAL_SIZE'
-            print('✅ 虚拟大小与分区匹配')
-        "
+            cat > /tmp/verify_sparse.py << 'VEOF'
+import struct, sys
+img_path = sys.argv[1]
+expected_size = int(sys.argv[2])
+with open(img_path, 'rb') as f:
+    f.seek(0x0C)
+    blk = struct.unpack('<I', f.read(4))[0]
+    blks = struct.unpack('<I', f.read(4))[0]
+    vs = blk * blks
+    print(f'sparse 虚拟大小: {vs} 字节 ({vs // 1024 // 1024} MB)')
+    assert vs == expected_size, f'虚拟大小不匹配! sparse={vs} 期望={expected_size}'
+    print('✅ 虚拟大小与分区匹配')
+VEOF
+            python3 /tmp/verify_sparse.py "$PURE_IMG" "$VIRTUAL_SIZE"
           else
             echo "❌ sparse 转换失败 (magic: $MAGIC)"
             exit 1
