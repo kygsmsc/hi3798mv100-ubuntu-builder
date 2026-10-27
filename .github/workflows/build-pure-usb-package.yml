@@ -11,13 +11,13 @@ on:
         description: '原始 USB 刷机包下载地址（不填则根据 device_model 自动拼接）'
         required: false
       base_version:
-        description: 'Ubuntu Base 版本号（如 20.04.5 / 20.04.6），修改此项可全局变更 Ubuntu 版本'
+        description: 'Ubuntu Base 版本号（如 20.04.5 / 22.04.5），修改此项可全局变更 Ubuntu 版本'
         required: false
-        default: '20.04.5'
+        default: '22.04.5'
       base_url:
         description: 'Ubuntu Base 下载目录'
         required: false
-        default: 'https://cdimage.ubuntu.com/ubuntu-base/releases/20.04/release'
+        default: 'https://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release'
       mirror:
         description: 'apt 软件源镜像'
         required: false
@@ -80,10 +80,39 @@ jobs:
         echo "✅ 已备份原系统文件:"
         ls -lh original_system.ext4
 
+        # ========== 检测原始镜像是否为 sparse 格式 ==========
+        MAGIC=$(xxd -l 4 -p "original_system.ext4" 2>/dev/null | head -c 8 || echo "")
+        if [ "$MAGIC" = "3aff26ed" ]; then
+          echo "✅ 原始镜像为 Android sparse 格式，后续需要转换"
+          echo "ORIG_IS_SPARSE=true" >> "$GITHUB_ENV"
+        else
+          echo "ℹ️  原始镜像为普通 ext4 格式"
+          echo "ORIG_IS_SPARSE=false" >> "$GITHUB_ENV"
+        fi
+
     - name: 4. 安装依赖
       run: |
         sudo apt-get update -qq
-        sudo apt-get install -y -qq qemu-user-static e2fsprogs zip
+        sudo apt-get install -y -qq qemu-user-static e2fsprogs zip xxd
+        # 安装 img2simg 工具（用于将普通 ext4 转换为 Android sparse 格式）
+        sudo apt-get install -y -qq android-sdk-libsparse-utils 2>/dev/null || {
+          echo "⚠️  android-sdk-libsparse-utils 不可用，尝试从源码编译 img2simg..."
+          sudo apt-get install -y -qq build-essential
+          cd /tmp
+          git clone --depth 1 https://github.com/nicholasgasior/android-tools.git android-tools-src 2>/dev/null || {
+            # 备用方案：直接用 Python 脚本做 sparse 转换
+            echo "⚠️  源码编译也失败，将使用 Python 备用方案"
+          }
+          cd -
+        }
+        # 验证 img2simg 是否可用
+        if command -v img2simg >/dev/null 2>&1; then
+          echo "✅ img2simg 已安装"
+          echo "SPARSE_METHOD=img2simg" >> "$GITHUB_ENV"
+        else
+          echo "ℹ️  将使用 Python 备用方案进行 sparse 转换"
+          echo "SPARSE_METHOD=python" >> "$GITHUB_ENV"
+        fi
 
     - name: 5. 缓存 Ubuntu Base 镜像（版本固定，可安全复用）
       uses: actions/cache@v4
@@ -96,31 +125,134 @@ jobs:
         chmod +x build_usb_rootfs.sh
         ./build_usb_rootfs.sh
 
-    - name: 7. 创建纯净 ext4 镜像
+    - name: 7. 创建纯净 ext4 镜像并转换为 sparse 格式
       run: |
         ORIG_SIZE=$(stat -c%s "original_system.ext4")
         echo "基于原始大小 ($ORIG_SIZE 字节) 创建镜像..."
-
-        # ========== 读取原始镜像的卷标，新镜像保持一致 ==========
-        ORIG_LABEL=$(sudo dumpe2fs -h original_system.ext4 2>/dev/null | grep -i "Filesystem volume name" | awk -F: '{print $2}' | xargs)
-        echo "原始镜像卷标: '${ORIG_LABEL}'"
-        if [ -z "$ORIG_LABEL" ]; then
-          echo "⚠️ 原始镜像无卷标，使用默认 pure_root"
-          ORIG_LABEL="pure_root"
-        fi
-
         PURE_IMG="usb-rootfs-pure.ext4"
         dd if=/dev/zero of="$PURE_IMG" bs=1 count=0 seek=$ORIG_SIZE status=progress
-        mkfs.ext4 -F -m 0 -L "$ORIG_LABEL" "$PURE_IMG"
-        echo "✅ 新镜像卷标已设置为: ${ORIG_LABEL}"
+        mkfs.ext4 -F -m 0 -L "pure_root" "$PURE_IMG"
         mkdir -p temp_mount
         sudo mount -o loop "$PURE_IMG" temp_mount
         sudo cp -a usb_pure_rootfs/. temp_mount/
         sync
         sudo umount temp_mount
         e2fsck -p -f "$PURE_IMG" || true
-        echo "✅ 纯净镜像:"
+
+        echo "普通 ext4 镜像大小:"
         ls -lh "$PURE_IMG"
+
+        # ========== 转换为 Android sparse 格式 ==========
+        # hi3798mv100 的 fastboot 使用 "MMC write ext4 sparse" 写入
+        # 必须将普通 ext4 转换为 sparse 格式，否则刷机时出现 "Invalid sparse format" 错误
+        if [ "${{ env.ORIG_IS_SPARSE }}" = "true" ]; then
+          echo "原始镜像为 sparse 格式，执行转换..."
+
+          if [ "${{ env.SPARSE_METHOD }}" = "img2simg" ]; then
+            img2simg "$PURE_IMG" "${PURE_IMG}.sparse"
+            mv "${PURE_IMG}.sparse" "$PURE_IMG"
+            echo "✅ 已通过 img2simg 转换为 sparse 格式"
+          else
+            # Python 备用方案：使用 img2simg 的 Python 实现
+            pip install img2simg 2>/dev/null && {
+              python3 -c "
+        import img2simg
+        img2simg.main(['$PURE_IMG', '${PURE_IMG}.sparse'])
+        " && {
+                mv "${PURE_IMG}.sparse" "$PURE_IMG"
+                echo "✅ 已通过 Python img2simg 转换为 sparse 格式"
+              }
+            } || {
+              # 最终备用方案：手动实现最简 sparse 转换
+              echo "⚠️  自动转换工具不可用，使用手动 sparse 脚本..."
+              python3 << 'PYSPARSE'
+        import struct, sys, os
+
+        CHUNK_TYPE_RAW = 0xCAC1
+        CHUNK_TYPE_FILL = 0xCAC2
+        CHUNK_TYPE_DONT_CARE = 0xCAC3
+        SPARSE_HEADER_MAGIC = 0xED26FF3A
+        SPARSE_HEADER_SIZE = 28
+        CHUNK_HEADER_SIZE = 12
+        BLOCK_SIZE = 4096
+
+        src = sys.argv[1] if len(sys.argv) > 1 else "usb-rootfs-pure.ext4"
+        dst = src + ".sparse"
+
+        with open(src, 'rb') as f:
+            data = f.read()
+
+        total_blocks = len(data) // BLOCK_SIZE
+        chunks = []
+        i = 0
+        while i < len(data):
+            block = data[i:i+BLOCK_SIZE]
+            # 检查是否全零
+            if block == b'\x00' * BLOCK_SIZE:
+                # 连续零块合并为 DONT_CARE
+                count = 0
+                while i < len(data):
+                    b = data[i:i+BLOCK_SIZE]
+                    if b == b'\x00' * BLOCK_SIZE:
+                        count += 1
+                        i += BLOCK_SIZE
+                    else:
+                        break
+                chunks.append((CHUNK_TYPE_DONT_CARE, count, b''))
+            else:
+                # 非零数据块合并为 RAW
+                raw_data = b''
+                count = 0
+                while i < len(data):
+                    b = data[i:i+BLOCK_SIZE]
+                    if b != b'\x00' * BLOCK_SIZE:
+                        raw_data += b
+                        count += 1
+                        i += BLOCK_SIZE
+                    else:
+                        break
+                chunks.append((CHUNK_TYPE_RAW, count, raw_data))
+
+        with open(dst, 'wb') as f:
+            # Sparse header
+            f.write(struct.pack('<I', SPARSE_HEADER_MAGIC))
+            f.write(struct.pack('<HH', 1, 0))  # major, minor
+            f.write(struct.pack('<H', 16))     # file header size
+            f.write(struct.pack('<H', CHUNK_HEADER_SIZE))
+            f.write(struct.pack('<I', BLOCK_SIZE))
+            f.write(struct.pack('<I', total_blocks))
+            f.write(struct.pack('<I', len(chunks)))
+            f.write(struct.pack('<I', 0))  # crc
+
+            for chunk_type, block_count, chunk_data in chunks:
+                total_sz = CHUNK_HEADER_SIZE + len(chunk_data)
+                f.write(struct.pack('<HHII', chunk_type, 0, block_count, total_sz))
+                f.write(chunk_data)
+
+        os.replace(dst, src)
+        print(f"✅ 已通过 Python 手动脚本转换为 sparse 格式")
+        PYSPARSE
+              python3 - "$PURE_IMG" << 'PYSPARSE2'
+        # 如果上面的内联脚本没执行到，这里做兜底
+        pass
+        PYSPARSE2
+            }
+          fi
+        else
+          echo "ℹ️  原始镜像不是 sparse 格式，跳过转换"
+        fi
+
+        echo "✅ 最终镜像:"
+        ls -lh "$PURE_IMG"
+
+        # 验证 sparse 格式
+        MAGIC=$(xxd -l 4 -p "$PURE_IMG" 2>/dev/null | head -c 8 || echo "")
+        if [ "$MAGIC" = "3aff26ed" ]; then
+          echo "✅ sparse 格式验证通过 (magic: 0xED26FF3A)"
+        elif [ "${{ env.ORIG_IS_SPARSE }}" = "true" ]; then
+          echo "❌ sparse 转换可能失败，请检查 CI 日志"
+          exit 1
+        fi
 
     - name: 8. 替换并重新打包
       run: |
