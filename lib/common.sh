@@ -25,12 +25,7 @@ ROOT_PASSWORD="${ROOT_PASSWORD:-root123}"
 TIMEZONE="${TIMEZONE:-Asia/Shanghai}"
 LOCALES="${LOCALES:-en_US.UTF-8 zh_CN.UTF-8}"
 
-# ========== [修复] 根据版本号自动推导 Ubuntu 代号 ==========\
-# 【关键修复】使用 cut 提取前两段（major.minor），例如 "22.04.5" -> "22.04"
-# 原始代码使用参数展开 %.*.* 会错误地只保留 "22" 而非 "22.04"
-# 导致 case 匹配不到 "22.04" 而走到默认分支返回 "focal"（错误！）
 UBUNTU_MAJOR_MINOR=$(echo "$UBUNTU_VERSION" | cut -d. -f1,2)
-
 case "$UBUNTU_MAJOR_MINOR" in
   20.04) UBUNTU_CODENAME="focal" ;;
   22.04) UBUNTU_CODENAME="jammy" ;;
@@ -40,6 +35,8 @@ esac
 export UBUNTU_CODENAME
 
 echo "==> [common.sh] UBUNTU_VERSION=$UBUNTU_VERSION  =>  MAJOR_MINOR=$UBUNTU_MAJOR_MINOR  =>  CODENAME=$UBUNTU_CODENAME"
+echo "==> [common.sh] BASE_URL=$BASE_URL"
+echo "==> [common.sh] MIRROR=$MIRROR"
 
 case "$MODE" in
   ttl) DEFAULT_ROOTFS_DIR="$(pwd)/pure_rootfs" ;;
@@ -50,7 +47,6 @@ ROOTFS_DIR="${ROOTFS_DIR:-$DEFAULT_ROOTFS_DIR}"
 BASE_TARBALL="ubuntu-base-${UBUNTU_VERSION}-base-armhf.tar.gz"
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# 已有 root 权限则直接执行，否则走 sudo
 if [ "$(id -u)" -eq 0 ]; then
   SUDO=""
 else
@@ -63,7 +59,6 @@ export LC_ALL=C
 
 log() { echo "==> $*"; }
 
-# 脚本退出（含失败/中断）时自动卸载所有挂载点，避免残留
 cleanup_mounts() {
   for m in tmp var/cache/apt/archives dev/pts dev sys proc; do
     $SUDO umount -lf "$ROOTFS_DIR/$m" 2>/dev/null || true
@@ -74,9 +69,16 @@ trap cleanup_mounts EXIT INT TERM
 # ---------- 下载 Ubuntu Base 并做 SHA256 完整性校验 ----------
 fetch_base() {
   log "下载 Ubuntu Base $UBUNTU_VERSION (armhf)..."
+  log "目标文件: cache/$BASE_TARBALL"
+  log "下载地址: $BASE_URL/$BASE_TARBALL"
   mkdir -p cache
   (
     cd cache
+    # 缓存命中但文件损坏时重新下载
+    if [ -f "$BASE_TARBALL" ] && ! tar -tzf "$BASE_TARBALL" >/dev/null 2>&1; then
+      echo "⚠️  缓存文件已损坏，重新下载"
+      rm -f "$BASE_TARBALL"
+    fi
     wget -q -c --tries=5 --timeout=60 "$BASE_URL/$BASE_TARBALL" || exit 1
     if wget -q --tries=3 --timeout=30 -O SHA256SUMS "$BASE_URL/SHA256SUMS" 2>/dev/null; then
       if grep -F "$BASE_TARBALL" SHA256SUMS | sha256sum -c - >/dev/null 2>&1; then
@@ -91,7 +93,6 @@ fetch_base() {
   )
 }
 
-# ---------- 准备目录并解压 ----------
 prepare_rootfs() {
   log "准备目录: $ROOTFS_DIR"
   $SUDO rm -rf "$ROOTFS_DIR"
@@ -100,7 +101,6 @@ prepare_rootfs() {
   $SUDO tar --numeric-owner -xpf "cache/$BASE_TARBALL" -C "$ROOTFS_DIR"
 }
 
-# ---------- 准备 Chroot 环境（QEMU 模拟 + 虚拟文件系统） ----------
 setup_chroot_env() {
   log "准备 Chroot 环境（QEMU 模拟 + 虚拟文件系统）..."
   if [ ! -f /usr/bin/qemu-arm-static ]; then
@@ -108,7 +108,6 @@ setup_chroot_env() {
     exit 1
   fi
   $SUDO cp /usr/bin/qemu-arm-static "$ROOTFS_DIR/usr/bin/"
-  # 有 binfmt 支持时确保注册（GitHub Runner / Docker 环境下一般已注册）
   command -v update-binfmts >/dev/null 2>&1 && $SUDO update-binfmts --enable qemu-arm 2>/dev/null || true
   $SUDO cp /etc/resolv.conf "$ROOTFS_DIR/etc/resolv.conf"
   $SUDO mkdir -p "$ROOTFS_DIR"/{proc,sys,dev,dev/pts,tmp,var/cache/apt/archives}
@@ -118,14 +117,12 @@ setup_chroot_env() {
   $SUDO mount -o bind /dev/pts "$ROOTFS_DIR/dev/pts"
 }
 
-# ---------- 拷贝 chroot 内配置脚本 ----------
 write_inner_script() {
   log "生成 Chroot 内配置脚本..."
   chmod +x "$LIB_DIR/rootfs_inner.sh"
   $SUDO cp "$LIB_DIR/rootfs_inner.sh" "$ROOTFS_DIR/tmp/rootfs_inner.sh"
 }
 
-# ---------- 执行 chroot 安装配置 ----------
 run_inner() {
   log "在 Chroot 中执行安装配置（耗时较长，请耐心等待）..."
   $SUDO chroot "$ROOTFS_DIR" /usr/bin/env \
@@ -135,7 +132,6 @@ run_inner() {
     /bin/bash /tmp/rootfs_inner.sh
 }
 
-# ---------- 收尾：卸载、清理、输出 ----------
 finish() {
   cleanup_mounts
   $SUDO rm -f "$ROOTFS_DIR/tmp/rootfs_inner.sh" "$ROOTFS_DIR/usr/bin/qemu-arm-static" 2>/dev/null || true
