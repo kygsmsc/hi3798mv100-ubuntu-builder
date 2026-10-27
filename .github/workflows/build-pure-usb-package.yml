@@ -90,14 +90,14 @@ jobs:
           # 从 sparse header 提取虚拟大小
           # sparse header: offset 0x0C = blk_sz(4B LE), offset 0x10 = total_blks(4B LE)
           cat > /tmp/read_sparse.py << 'PYEOF'
-import struct, sys
-with open(sys.argv[1], 'rb') as f:
-    f.seek(0x0C)
-    blk_sz = struct.unpack('<I', f.read(4))[0]
-    total_blks = struct.unpack('<I', f.read(4))[0]
-    virtual_size = blk_sz * total_blks
-    print(f'{blk_sz} {total_blks} {virtual_size}')
-PYEOF
+          import struct, sys
+          with open(sys.argv[1], 'rb') as f:
+          f.seek(0x0C)
+          blk_sz = struct.unpack('<I', f.read(4))[0]
+          total_blks = struct.unpack('<I', f.read(4))[0]
+          virtual_size = blk_sz * total_blks
+          print(f'{blk_sz} {total_blks} {virtual_size}')
+          PYEOF
           BLOCK_SIZE=$(python3 /tmp/read_sparse.py "original_system.ext4")
           echo "sparse header 解析结果: $BLOCK_SIZE"
           BLK_SZ=$(echo "$BLOCK_SIZE" | awk '{print $1}')
