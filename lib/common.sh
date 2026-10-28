@@ -17,23 +17,22 @@
 # ============================================================
 # lib/common.sh — hi3798mv100 纯净 Ubuntu rootfs 构建核心
 # ============================================================
-
 set -euo pipefail
 
 MODE="${MODE:?请通过 build_rootfs.sh (ttl) 或 build_usb_rootfs.sh (usb) 调用}"
 UBUNTU_VERSION="${UBUNTU_VERSION:-20.04.5}"
-BASE_URL="${BASE_URL:-https://cdimage.ubuntu.com/ubuntu-base/releases/20.04/release}"
+# 根据 UBUNTU_VERSION 自动推导 BASE_URL 默认值（覆盖 20.04 / 22.04 / 24.04）
+_UBUNTU_SERIES=$(echo "$UBUNTU_VERSION" | cut -d. -f1,2)
+BASE_URL="${BASE_URL:-https://cdimage.ubuntu.com/ubuntu-base/releases/${_UBUNTU_SERIES}/release}"
 MIRROR="${MIRROR:-http://repo.huaweicloud.com/ubuntu-ports}"
 
-# HOSTNAME 是 bash 内建变量，必须改名 TARGET_HOSTNAME
 TARGET_HOSTNAME="${TARGET_HOSTNAME:-hi3798mv100}"
 CUSTOM_MAC="${CUSTOM_MAC:-}"
 ROOT_PASSWORD="${ROOT_PASSWORD:-root123}"
 TIMEZONE="${TIMEZONE:-Asia/Shanghai}"
 LOCALES="${LOCALES:-en_US.UTF-8 zh_CN.UTF-8}"
 
-UBUNTU_MAJOR_MINOR=$(echo "$UBUNTU_VERSION" | cut -d. -f1,2)
-case "$UBUNTU_MAJOR_MINOR" in
+case "$_UBUNTU_SERIES" in
   20.04) UBUNTU_CODENAME="focal" ;;
   22.04) UBUNTU_CODENAME="jammy" ;;
   24.04) UBUNTU_CODENAME="noble" ;;
@@ -106,6 +105,7 @@ prepare_rootfs() {
   mkdir -p "$ROOTFS_DIR"
   log "解压 Ubuntu Base..."
   $SUDO tar --numeric-owner -xpf "cache/$BASE_TARBALL" -C "$ROOTFS_DIR"
+  $SUDO chown root:root "$ROOTFS_DIR"
 }
 
 setup_chroot_env() {
@@ -178,7 +178,7 @@ finish() {
 
   if [ "$FAIL" -ne 0 ]; then
     echo "=============================================="
-    echo "❌ 审计失败：rootfs 中存在不应有的文件"
+    echo "❌ 审计失败"
     echo "=============================================="
     exit 1
   fi
