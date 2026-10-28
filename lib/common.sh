@@ -17,6 +17,7 @@
 # ============================================================
 # lib/common.sh — hi3798mv100 纯净 Ubuntu rootfs 构建核心
 # ============================================================
+
 set -euo pipefail
 
 MODE="${MODE:?请通过 build_rootfs.sh (ttl) 或 build_usb_rootfs.sh (usb) 调用}"
@@ -24,10 +25,9 @@ UBUNTU_VERSION="${UBUNTU_VERSION:-20.04.5}"
 BASE_URL="${BASE_URL:-https://cdimage.ubuntu.com/ubuntu-base/releases/20.04/release}"
 MIRROR="${MIRROR:-http://repo.huaweicloud.com/ubuntu-ports}"
 
-# 【修复1】改名为 TARGET_HOSTNAME，避免与 bash 内建 $HOSTNAME 冲突
-# 原代码 HOSTNAME="${HOSTNAME:-hi3798mv100}" 在 CI 环境下会取到 runner 的 hostname
+# HOSTNAME 是 bash 内建变量，必须改名 TARGET_HOSTNAME
 TARGET_HOSTNAME="${TARGET_HOSTNAME:-hi3798mv100}"
-
+CUSTOM_MAC="${CUSTOM_MAC:-}"
 ROOT_PASSWORD="${ROOT_PASSWORD:-root123}"
 TIMEZONE="${TIMEZONE:-Asia/Shanghai}"
 LOCALES="${LOCALES:-en_US.UTF-8 zh_CN.UTF-8}"
@@ -37,12 +37,13 @@ case "$UBUNTU_MAJOR_MINOR" in
   20.04) UBUNTU_CODENAME="focal" ;;
   22.04) UBUNTU_CODENAME="jammy" ;;
   24.04) UBUNTU_CODENAME="noble" ;;
-  *)     echo "⚠️  未知版本号 $UBUNTU_VERSION，默认 focal" >&2; UBUNTU_CODENAME="focal" ;;
+  *)     echo "⚠️  未知版本 $UBUNTU_VERSION，默认 focal" >&2; UBUNTU_CODENAME="focal" ;;
 esac
 export UBUNTU_CODENAME
 
 echo "==> [common.sh] UBUNTU_VERSION=$UBUNTU_VERSION  =>  CODENAME=$UBUNTU_CODENAME"
 echo "==> [common.sh] TARGET_HOSTNAME=$TARGET_HOSTNAME"
+echo "==> [common.sh] CUSTOM_MAC=${CUSTOM_MAC:-(未设置，用设备原生 MAC)}"
 echo "==> [common.sh] BASE_URL=$BASE_URL"
 echo "==> [common.sh] MIRROR=$MIRROR"
 
@@ -59,7 +60,7 @@ if [ "$(id -u)" -eq 0 ]; then
   SUDO=""
 else
   SUDO="sudo"
-  $SUDO -v 2>/dev/null || { echo "❌ 需要 root 权限或可用 sudo" >&2; exit 1; }
+  $SUDO -v 2>/dev/null || { echo "❌ 需要 root 权限或 sudo" >&2; exit 1; }
 fi
 
 export DEBIAN_FRONTEND=noninteractive
@@ -82,7 +83,7 @@ fetch_base() {
   (
     cd cache
     if [ -f "$BASE_TARBALL" ] && ! tar -tzf "$BASE_TARBALL" >/dev/null 2>&1; then
-      echo "⚠️  缓存文件损坏，重新下载"
+      echo "⚠️  缓存损坏，重新下载"
       rm -f "$BASE_TARBALL"
     fi
     wget -q -c --tries=5 --timeout=60 "$BASE_URL/$BASE_TARBALL" || exit 1
@@ -94,7 +95,7 @@ fetch_base() {
         exit 1
       fi
     else
-      echo "⚠️  未获取到 SHA256SUMS，跳过校验"
+      echo "⚠️  未获取 SHA256SUMS，跳过校验"
     fi
   )
 }
@@ -110,7 +111,7 @@ prepare_rootfs() {
 setup_chroot_env() {
   log "准备 Chroot 环境..."
   if [ ! -f /usr/bin/qemu-arm-static ]; then
-    echo "❌ 未找到 /usr/bin/qemu-arm-static，请先: sudo apt-get install qemu-user-static" >&2
+    echo "❌ 未找到 /usr/bin/qemu-arm-static，请: sudo apt-get install qemu-user-static" >&2
     exit 1
   fi
   $SUDO cp /usr/bin/qemu-arm-static "$ROOTFS_DIR/usr/bin/"
@@ -130,18 +131,59 @@ write_inner_script() {
 }
 
 run_inner() {
-  log "在 Chroot 中执行安装配置（耗时较长，请耐心等待）..."
-  # 【修复1续】传递 TARGET_HOSTNAME 给 chroot 内的 HOSTNAME 环境变量
+  log "在 Chroot 中执行安装配置（耗时较长）..."
   $SUDO chroot "$ROOTFS_DIR" /usr/bin/env \
     MODE="$MODE" MIRROR="$MIRROR" HOSTNAME="$TARGET_HOSTNAME" \
     ROOT_PASSWORD="$ROOT_PASSWORD" TIMEZONE="$TIMEZONE" LOCALES="$LOCALES" \
-    UBUNTU_CODENAME="$UBUNTU_CODENAME" \
+    UBUNTU_CODENAME="$UBUNTU_CODENAME" CUSTOM_MAC="$CUSTOM_MAC" \
     /bin/bash /tmp/rootfs_inner.sh
 }
 
 finish() {
   cleanup_mounts
   $SUDO rm -f "$ROOTFS_DIR/tmp/rootfs_inner.sh" "$ROOTFS_DIR/usr/bin/qemu-arm-static" 2>/dev/null || true
+
+  log "rootfs 发版前审计"
+  local FAIL=0
+  local SUSPECT=(
+    "root/mv100" "root/sdat2img" "root/simg2img" "root/sparse_info"
+    "root/work" "root/original_usb" "root/www_raw" "root/mv100.zip"
+    "www_raw.ext4" "backup-32.gz" "sdat2img.py" "simg2img.py"
+    "p9-rootfs.img" "p8-backup.img" "qemu-arm-static"
+  )
+  for s in "${SUSPECT[@]}"; do
+    if [ -e "$ROOTFS_DIR/$s" ]; then
+      echo "❌ 可疑文件: $ROOTFS_DIR/$s"
+      FAIL=1
+    fi
+  done
+
+  local BAD_ROOT
+  BAD_ROOT=$($SUDO find "$ROOTFS_DIR/root" -mindepth 1 -maxdepth 1 \
+      ! -name '.bashrc' ! -name '.profile' ! -name '.bash_logout' \
+      ! -name '.cache' ! -name '.local' 2>/dev/null)
+  if [ -n "$BAD_ROOT" ]; then
+    echo "❌ /root 非标准:"
+    echo "$BAD_ROOT"
+    FAIL=1
+  fi
+
+  local TMP_COUNT
+  TMP_COUNT=$($SUDO find "$ROOTFS_DIR/tmp" -mindepth 1 2>/dev/null | wc -l)
+  if [ "$TMP_COUNT" -ne 0 ]; then
+    echo "❌ /tmp 非空: $TMP_COUNT 条目"
+    $SUDO ls -la "$ROOTFS_DIR/tmp/"
+    FAIL=1
+  fi
+
+  if [ "$FAIL" -ne 0 ]; then
+    echo "=============================================="
+    echo "❌ 审计失败：rootfs 中存在不应有的文件"
+    echo "=============================================="
+    exit 1
+  fi
+  echo "✅ 审计通过：rootfs 干净"
+
   local SIZE
   SIZE="$($SUDO du -sh "$ROOTFS_DIR" | cut -f1)"
   echo "=============================================="
