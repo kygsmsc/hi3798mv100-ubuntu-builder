@@ -4,10 +4,6 @@
 # 所需变量由 common.sh 通过 /usr/bin/env 传入：
 #   MODE MIRROR HOSTNAME ROOT_PASSWORD TIMEZONE LOCALES UBUNTU_CODENAME
 # lib/rootfs_inner.sh — 在 chroot 内执行的系统配置脚本
-#!/bin/bash
-# lib/rootfs_inner.sh — 在 chroot 内执行的系统配置脚本
-#!/bin/bash
-# lib/rootfs_inner.sh — 在 chroot 内执行的系统配置脚本
 # 兼容 Ubuntu 20.04 (focal) / 22.04 (jammy) / 24.04 (noble)
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
@@ -44,7 +40,6 @@ echo "==> Ubuntu 代号: $CODENAME"
 echo "==> 软件源: $MIRROR"
 
 # ========== 兼容性：APT 源格式 ==========
-# Ubuntu 24.04 (noble) 起默认使用 DEB822 格式
 if [ "$CODENAME" = "noble" ]; then
     echo "==> 使用 DEB822 格式软件源 (Ubuntu 24.04+)"
     mkdir -p /etc/apt/sources.list.d
@@ -61,7 +56,6 @@ Suites: $CODENAME-security
 Components: main restricted universe multiverse
 Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 SOURCES
-    # 清空传统文件，避免重复/冲突
     > /etc/apt/sources.list
 else
     echo "==> 使用传统格式软件源 (Ubuntu 20.04 / 22.04)"
@@ -151,7 +145,6 @@ case "$ACTION" in
         mount -t vfat -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" || true
         ;;
       exfat)
-        # 4.4 内核无 exfat driver，必须走 FUSE
         mount.exfat-fuse -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" 2>/dev/null \
           || mount -t exfat -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" 2>/dev/null \
           || true
@@ -188,14 +181,53 @@ ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
 echo "$TIMEZONE" > /etc/timezone
 dpkg-reconfigure -f noninteractive tzdata >/dev/null 2>&1 || true
 
+# ============================================================
+# 【关键修复】root 密码设置
+# 删掉 chage + sed 整段（有 bug：sed 会删掉 shadow 里 root: 前缀）
+# 只用 chpasswd，它本身就会更新 shadow 的 last change date
+# ============================================================
+echo "==> 设置 root 密码（长度 ${#ROOT_PASSWORD} 字符）"
 echo "root:$ROOT_PASSWORD" | chpasswd
-TODAY=$(date +%Y-%m-%d)
-chage -d "$TODAY" root 2>/dev/null || true
-if ! chage -l root 2>/dev/null | grep -q "$TODAY"; then
-  DAYS=$(( $(date +%s) / 86400 ))
-  sed -i "s/^root:\([^:]*\):[0-9]*:/\1:$DAYS:/" /etc/shadow
-fi
 sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+
+# ============================================================
+# 【新增】firstboot-password.service
+# 首次启动时强制重置 root 密码为 CI 输入的值：
+#   - 覆盖 p7 recovery 可能的密码修改
+#   - 时间戳用设备当前时间，修复 "password changed in future"
+# ============================================================
+printf '%s\n' "$ROOT_PASSWORD" > /etc/firstboot-pwd.txt
+chmod 600 /etc/firstboot-pwd.txt
+chown root:root /etc/firstboot-pwd.txt
+
+cat > /usr/local/sbin/firstboot-password.sh << 'SH'
+#!/bin/bash
+[ -f /etc/firstboot-pwd.txt ] || exit 0
+PWD=$(cat /etc/firstboot-pwd.txt)
+echo "root:$PWD" | chpasswd
+chage -d "$(date +%Y-%m-%d)" root 2>/dev/null || true
+rm -f /etc/firstboot-pwd.txt
+touch /var/lib/firstboot-password.done
+SH
+chmod +x /usr/local/sbin/firstboot-password.sh
+
+cat > /etc/systemd/system/firstboot-password.service << 'SVC'
+[Unit]
+Description=First boot: force reset root password
+ConditionPathExists=!/var/lib/firstboot-password.done
+Before=ssh.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/firstboot-password.sh
+
+[Install]
+WantedBy=multi-user.target
+SVC
+
+systemctl enable firstboot-password.service 2>/dev/null || true
+echo "✅ firstboot-password.service 已启用（首次启动强制设置 root 密码）"
 
 # ========== 网络配置 ==========
 echo "==> 网络配置 (DHCP)"
@@ -238,7 +270,7 @@ update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 >/dev/null 2>&1 || true
 
 systemd-machine-id-setup 2>/dev/null || true
 
-# ========== SSH 主机密钥重新生成（用正确 hostname 做 comment）==========
+# ========== SSH 主机密钥（用正确 hostname 做 comment）==========
 rm -f /etc/ssh/ssh_host_*
 if command -v ssh-keygen >/dev/null 2>&1; then
   mkdir -p /etc/ssh
@@ -273,7 +305,7 @@ ProtectProc=default
 ProcSubset=all
 LOGIND
 else
-    echo "==> systemd ${SYSTEMD_VER:-未知} < 247，跳过 logind 兼容配置（选项不存在）"
+    echo "==> systemd ${SYSTEMD_VER:-未知} < 247，跳过 logind 兼容配置"
 fi
 
 mkdir -p /etc/systemd/resolved.conf.d
@@ -366,6 +398,11 @@ echo "--- USB 支持文件 ---"
 ls -la /usr/local/sbin/usb-mount.sh \
        /etc/udev/rules.d/99-usb-storage-mount.rules \
        /etc/systemd/system/usb-mount@.service 2>/dev/null || echo "(MISSING!)"
+echo "--- firstboot-password 文件 ---"
+ls -la /etc/firstboot-pwd.txt /usr/local/sbin/firstboot-password.sh \
+       /etc/systemd/system/firstboot-password.service 2>/dev/null || echo "(MISSING!)"
+echo "--- /etc/shadow 中 root 行（前 30 字符）---"
+grep '^root:' /etc/shadow | cut -c1-30
 echo "--- SSH 主机密钥 comment ---"
 for k in /etc/ssh/ssh_host_*_key.pub; do
   [ -f "$k" ] && ssh-keygen -lf "$k" 2>/dev/null
