@@ -14,13 +14,20 @@
 #   LOCALES         生成的 locale（空格分隔）     （默认 en_US.UTF-8 zh_CN.UTF-8）
 #   ROOTFS_DIR      输出目录                      （默认 ./pure_rootfs 或 ./usb_pure_rootfs）
 # ============================================================
+# ============================================================
+# lib/common.sh — hi3798mv100 纯净 Ubuntu rootfs 构建核心
+# ============================================================
 set -euo pipefail
 
 MODE="${MODE:?请通过 build_rootfs.sh (ttl) 或 build_usb_rootfs.sh (usb) 调用}"
 UBUNTU_VERSION="${UBUNTU_VERSION:-20.04.5}"
 BASE_URL="${BASE_URL:-https://cdimage.ubuntu.com/ubuntu-base/releases/20.04/release}"
 MIRROR="${MIRROR:-http://repo.huaweicloud.com/ubuntu-ports}"
-HOSTNAME="${HOSTNAME:-hi3798mv100}"
+
+# 【修复1】改名为 TARGET_HOSTNAME，避免与 bash 内建 $HOSTNAME 冲突
+# 原代码 HOSTNAME="${HOSTNAME:-hi3798mv100}" 在 CI 环境下会取到 runner 的 hostname
+TARGET_HOSTNAME="${TARGET_HOSTNAME:-hi3798mv100}"
+
 ROOT_PASSWORD="${ROOT_PASSWORD:-root123}"
 TIMEZONE="${TIMEZONE:-Asia/Shanghai}"
 LOCALES="${LOCALES:-en_US.UTF-8 zh_CN.UTF-8}"
@@ -30,18 +37,19 @@ case "$UBUNTU_MAJOR_MINOR" in
   20.04) UBUNTU_CODENAME="focal" ;;
   22.04) UBUNTU_CODENAME="jammy" ;;
   24.04) UBUNTU_CODENAME="noble" ;;
-  *)     echo "⚠️  未知版本号 $UBUNTU_VERSION (解析为 $UBUNTU_MAJOR_MINOR)，默认使用 focal" >&2; UBUNTU_CODENAME="focal" ;;
+  *)     echo "⚠️  未知版本号 $UBUNTU_VERSION，默认 focal" >&2; UBUNTU_CODENAME="focal" ;;
 esac
 export UBUNTU_CODENAME
 
-echo "==> [common.sh] UBUNTU_VERSION=$UBUNTU_VERSION  =>  MAJOR_MINOR=$UBUNTU_MAJOR_MINOR  =>  CODENAME=$UBUNTU_CODENAME"
+echo "==> [common.sh] UBUNTU_VERSION=$UBUNTU_VERSION  =>  CODENAME=$UBUNTU_CODENAME"
+echo "==> [common.sh] TARGET_HOSTNAME=$TARGET_HOSTNAME"
 echo "==> [common.sh] BASE_URL=$BASE_URL"
 echo "==> [common.sh] MIRROR=$MIRROR"
 
 case "$MODE" in
   ttl) DEFAULT_ROOTFS_DIR="$(pwd)/pure_rootfs" ;;
   usb) DEFAULT_ROOTFS_DIR="$(pwd)/usb_pure_rootfs" ;;
-  *)   echo "❌ 未知 MODE: $MODE（仅支持 ttl / usb）" >&2; exit 1 ;;
+  *)   echo "❌ 未知 MODE: $MODE" >&2; exit 1 ;;
 esac
 ROOTFS_DIR="${ROOTFS_DIR:-$DEFAULT_ROOTFS_DIR}"
 BASE_TARBALL="ubuntu-base-${UBUNTU_VERSION}-base-armhf.tar.gz"
@@ -66,17 +74,15 @@ cleanup_mounts() {
 }
 trap cleanup_mounts EXIT INT TERM
 
-# ---------- 下载 Ubuntu Base 并做 SHA256 完整性校验 ----------
 fetch_base() {
   log "下载 Ubuntu Base $UBUNTU_VERSION (armhf)..."
-  log "目标文件: cache/$BASE_TARBALL"
-  log "下载地址: $BASE_URL/$BASE_TARBALL"
+  log "目标: cache/$BASE_TARBALL"
+  log "来源: $BASE_URL/$BASE_TARBALL"
   mkdir -p cache
   (
     cd cache
-    # 缓存命中但文件损坏时重新下载
     if [ -f "$BASE_TARBALL" ] && ! tar -tzf "$BASE_TARBALL" >/dev/null 2>&1; then
-      echo "⚠️  缓存文件已损坏，重新下载"
+      echo "⚠️  缓存文件损坏，重新下载"
       rm -f "$BASE_TARBALL"
     fi
     wget -q -c --tries=5 --timeout=60 "$BASE_URL/$BASE_TARBALL" || exit 1
@@ -84,11 +90,11 @@ fetch_base() {
       if grep -F "$BASE_TARBALL" SHA256SUMS | sha256sum -c - >/dev/null 2>&1; then
         echo "✅ SHA256 校验通过"
       else
-        echo "❌ SHA256 校验失败，下载可能不完整" >&2
+        echo "❌ SHA256 校验失败" >&2
         exit 1
       fi
     else
-      echo "⚠️  未获取到 SHA256SUMS，跳过完整性校验"
+      echo "⚠️  未获取到 SHA256SUMS，跳过校验"
     fi
   )
 }
@@ -102,9 +108,9 @@ prepare_rootfs() {
 }
 
 setup_chroot_env() {
-  log "准备 Chroot 环境（QEMU 模拟 + 虚拟文件系统）..."
+  log "准备 Chroot 环境..."
   if [ ! -f /usr/bin/qemu-arm-static ]; then
-    echo "❌ 未找到 /usr/bin/qemu-arm-static，请先安装: sudo apt-get install qemu-user-static" >&2
+    echo "❌ 未找到 /usr/bin/qemu-arm-static，请先: sudo apt-get install qemu-user-static" >&2
     exit 1
   fi
   $SUDO cp /usr/bin/qemu-arm-static "$ROOTFS_DIR/usr/bin/"
@@ -125,8 +131,9 @@ write_inner_script() {
 
 run_inner() {
   log "在 Chroot 中执行安装配置（耗时较长，请耐心等待）..."
+  # 【修复1续】传递 TARGET_HOSTNAME 给 chroot 内的 HOSTNAME 环境变量
   $SUDO chroot "$ROOTFS_DIR" /usr/bin/env \
-    MODE="$MODE" MIRROR="$MIRROR" HOSTNAME="$HOSTNAME" \
+    MODE="$MODE" MIRROR="$MIRROR" HOSTNAME="$TARGET_HOSTNAME" \
     ROOT_PASSWORD="$ROOT_PASSWORD" TIMEZONE="$TIMEZONE" LOCALES="$LOCALES" \
     UBUNTU_CODENAME="$UBUNTU_CODENAME" \
     /bin/bash /tmp/rootfs_inner.sh
