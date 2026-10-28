@@ -11,7 +11,7 @@ on:
         description: '原始 USB 刷机包下载地址（不填则根据 device_model 自动拼接）'
         required: false
       base_version:
-        description: 'Ubuntu Base 版本号（如 20.04.5 / 22.04.5）'
+        description: 'Ubuntu Base 版本号（如 20.04.5 / 22.04.5 / 24.04.5）'
         required: false
         default: '20.04.5'
       base_url:
@@ -87,7 +87,6 @@ jobs:
         find usb_template -type f | sort
         echo "========================================="
 
-        # 验证 fastboot 必备文件
         REQUIRED=(
           "bootargs.bin"
           "fastboot.bin"
@@ -110,8 +109,6 @@ jobs:
         fi
         echo "✅ 原厂包必备文件齐全"
 
-        # ========== 关键：只读 sparse 头，不解压、不挂载、不读内容 ==========
-        # 这是路径A唯一的动作：读 20 字节计算 P8_SIZE
         cp "usb_template/mv100/www_ecoo_top.ext4" original_p8.sparse
         MAGIC=$(xxd -p -l 4 original_p8.sparse)
         echo "原厂 p8 magic: $MAGIC"
@@ -125,14 +122,8 @@ jobs:
         echo "原厂 p8 raw 大小: $P8_SIZE 字节 ($((P8_SIZE/1024/1024)) MB)"
         echo "P8_SIZE=$P8_SIZE" >> "$GITHUB_ENV"
 
-        # 明确声明：原厂 p8 内容未解压、未挂载、未复制
         echo ""
         echo "⚠️  后续流程将【完全不碰】原厂 www_ecoo_top.ext4 的实际内容"
-        echo "   - 不 simg2img"
-        echo "   - 不挂载"
-        echo "   - 不解压 backup-32.gz"
-        echo "   - 不复制任何文件"
-        echo "   本步骤到此结束"
 
     - name: 4. 安装依赖
       run: |
@@ -156,7 +147,6 @@ jobs:
 
     - name: 7. 构建 p9 → backup-32.gz → p8（全程审计，每步验证无杂质）
       run: |
-        # ========== 前置：rootfs 放得下吗 ==========
         ROOTFS_MB=$(sudo du -sm usb_pure_rootfs | cut -f1)
         echo "rootfs 实际大小: ${ROOTFS_MB} MB"
         if [ "$ROOTFS_MB" -gt $((P9_SIZE_MB * 90 / 100)) ]; then
@@ -164,7 +154,7 @@ jobs:
           exit 1
         fi
 
-        # ========== 步骤7.1：创建 p9 rootfs ext4（只拷贝 usb_pure_rootfs）==========
+        # 7.1 p9 rootfs ext4
         P9_IMG="p9-rootfs.img"
         rm -f "$P9_IMG"
         echo ""
@@ -174,15 +164,11 @@ jobs:
 
         mkdir -p mnt_p9
         sudo mount -o loop "$P9_IMG" mnt_p9
-
-        # 【唯一拷贝动作】只从 usb_pure_rootfs/ 拷贝，路径B 与路径A 完全隔离
         echo ">>> 拷贝源：usb_pure_rootfs/（我们构建的纯净 rootfs）"
         sudo cp -a usb_pure_rootfs/. mnt_p9/
         sync
 
-        # ============================================================
-        # 【审计 1】新 p9 /root/ 必须只有标准文件
-        # ============================================================
+        # 审计1
         echo ""
         echo "========== 审计1：新 p9 /root/ 内容 =========="
         sudo ls -la mnt_p9/root/ | awk 'NR>1 {print $1, $3, $4, $9, $10, $11}'
@@ -192,15 +178,12 @@ jobs:
         if [ -n "$BAD_P9_ROOT" ]; then
           echo "❌ 新 p9 /root/ 下有非标准文件:"
           echo "$BAD_P9_ROOT"
-          echo "   构建流程出现污染！"
           sudo umount mnt_p9
           exit 1
         fi
-        echo "✅ 审计1通过：新 p9 /root/ 只有 .bashrc/.profile/.cache/.local 等标准文件"
+        echo "✅ 审计1通过"
 
-        # ============================================================
-        # 【审计 2】新 p9 /tmp 和 /home 必须为空
-        # ============================================================
+        # 审计2
         echo ""
         echo "========== 审计2：新 p9 /tmp 和 /home 为空 =========="
         TMP_COUNT=$(sudo find mnt_p9/tmp -mindepth 1 2>/dev/null | wc -l)
@@ -209,16 +192,12 @@ jobs:
         echo "/home 条目数: $HOME_COUNT"
         if [ "$TMP_COUNT" -ne 0 ] || [ "$HOME_COUNT" -ne 0 ]; then
           echo "❌ 新 p9 /tmp 或 /home 非空"
-          sudo ls -la mnt_p9/tmp/
-          sudo ls -la mnt_p9/home/
           sudo umount mnt_p9
           exit 1
         fi
-        echo "✅ 审计2通过：/tmp 和 /home 干净"
+        echo "✅ 审计2通过"
 
-        # ============================================================
-        # 【审计 3】全盘搜可疑文件名（zip/ext4/img/诊断脚本/构建中间产物）
-        # ============================================================
+        # 审计3
         echo ""
         echo "========== 审计3：新 p9 全盘可疑文件搜索 =========="
         SUSPECT=$(sudo find mnt_p9 -type f \
@@ -234,11 +213,9 @@ jobs:
           sudo umount mnt_p9
           exit 1
         fi
-        echo "✅ 审计3通过：新 p9 全盘无任何可疑文件"
+        echo "✅ 审计3通过"
 
-        # ============================================================
-        # 【审计 4】非白名单顶层目录审计（防止误拷 rootfs 外的目录）
-        # ============================================================
+        # 审计4
         echo ""
         echo "========== 审计4：新 p9 顶层目录列表 =========="
         sudo ls -la mnt_p9/ | awk 'NR>1 {print $1, $3, $4, $9}'
@@ -246,17 +223,14 @@ jobs:
         sudo umount mnt_p9
         e2fsck -p -f "$P9_IMG" || true
         echo "p9 rootfs: $(stat -c%s "$P9_IMG") 字节"
-        echo "✅ 7.1 完成：新 p9 已生成，通过全部 4 项审计"
 
-        # ========== 步骤7.2：gzip -9 压缩为 backup-32.gz ==========
+        # 7.2 backup-32.gz
         echo ""
         echo "===== 7.2 压缩为 backup-32.gz ====="
         rm -f backup-32.gz
         gzip -9 -c "$P9_IMG" > backup-32.gz
         B32_SIZE=$(stat -c%s backup-32.gz)
         echo "backup-32.gz: $B32_SIZE 字节 ($((B32_SIZE/1024/1024)) MB)"
-        echo "⚠️  此 backup-32.gz 完全由上面审计过的 p9-rootfs.img 压缩而来"
-        echo "   与原厂 backup-32.gz 无关（原厂 backup-32.gz 从未被读取）"
 
         P8_MAX=$((P8_SIZE - 10*1024*1024))
         if [ "$B32_SIZE" -ge "$P8_MAX" ]; then
@@ -265,7 +239,7 @@ jobs:
         fi
         echo "✅ backup-32.gz 可放入 p8"
 
-        # ========== 步骤7.3：创建 p8 backup ext4（只放新 backup-32.gz）==========
+        # 7.3 p8 backup ext4
         echo ""
         echo "===== 7.3 创建 p8 backup ext4 ($P8_SIZE 字节) ====="
         P8_IMG="p8-backup.img"
@@ -275,13 +249,10 @@ jobs:
 
         mkdir -p mnt_p8
         sudo mount -o loop "$P8_IMG" mnt_p8
-        # 【唯一拷贝动作】只放新生成的 backup-32.gz
         sudo cp backup-32.gz mnt_p8/
         sync
 
-        # ============================================================
-        # 【审计 5】新 p8 必须只有 backup-32.gz + lost+found
-        # ============================================================
+        # 审计5
         echo ""
         echo "========== 审计5：新 p8 分区内容 =========="
         sudo ls -la mnt_p8/ | awk 'NR>1 {print $1, $3, $4, $9}'
@@ -299,20 +270,18 @@ jobs:
           sudo umount mnt_p8
           exit 1
         fi
-        # 确认 p8 里的 backup-32.gz 就是我们刚生成的（对比大小）
         P8_B32_SIZE=$(sudo stat -c%s mnt_p8/backup-32.gz)
         if [ "$P8_B32_SIZE" != "$B32_SIZE" ]; then
-          echo "❌ p8 内 backup-32.gz 大小不符: $P8_B32_SIZE != $B32_SIZE"
+          echo "❌ p8 内 backup-32.gz 大小不符"
           sudo umount mnt_p8
           exit 1
         fi
-        echo "✅ 审计5通过：p8 内只有 backup-32.gz（大小与生成的一致）"
+        echo "✅ 审计5通过"
 
         sudo umount mnt_p8
         e2fsck -p -f "$P8_IMG" || true
-        echo "p8 raw: $(stat -c%s "$P8_IMG") 字节"
 
-        # ========== 步骤7.4：转 sparse ==========
+        # 7.4 转 sparse
         echo ""
         echo "===== 7.4 转 Android sparse ====="
         rm -f www_ecoo_top.img
@@ -329,18 +298,11 @@ jobs:
         echo "ROOTFS_MB=$ROOTFS_MB" >> "$GITHUB_ENV"
         rm -f "$P9_IMG"
 
-        # ========== 最终数据流声明 ==========
         echo ""
         echo "=============================================="
-        echo "✅ step 7 完成"
-        echo "   数据流：Ubuntu Base → usb_pure_rootfs → 新 p9 ext4 → 新 backup-32.gz → 新 p8 ext4 → sparse"
-        echo "   原厂 p8 内容：从未解压、从未挂载、从未复制"
-        echo "   所有审计通过：新 p9 干净、新 p8 干净"
+        echo "✅ step 7 完成，5 项审计全部通过"
         echo "=============================================="
 
-    # ============================================================
-    # 白名单复制 + U 盘根审计
-    # ============================================================
     - name: 8. 白名单复制并重新打包
       run: |
         SOURCE_OS="Ubuntu_${{ env.UBUNTU_VERSION }}"
@@ -370,11 +332,9 @@ jobs:
           echo "  + $f"
         done
 
-        # 替换为我们的新 p8
         cp www_ecoo_top.img "$FINAL_DIR/mv100/www_ecoo_top.ext4"
-        echo "  + mv100/www_ecoo_top.ext4 (新构建，含新 backup-32.gz)"
+        echo "  + mv100/www_ecoo_top.ext4 (新构建)"
 
-        # 审计：最终包只有 10 个文件
         echo "========== 最终刷机包文件清单 =========="
         ACTUAL_FILES=$(find "$FINAL_DIR" -type f | sort)
         echo "$ACTUAL_FILES"
@@ -429,18 +389,19 @@ jobs:
           自定义 MAC：    ${{ env.CUSTOM_MAC }}
           构建日期：      $(date '+%Y-%m-%d %H:%M:%S')
 
-        【构建流程保证】
-          本刷机包的 p9 rootfs 完全从 Ubuntu Base 构建，与原厂 p9 内容无任何交集：
-          - 原厂 www_ecoo_top.ext4 仅读取 20 字节 sparse 头用于计算 P8_SIZE
-          - 原厂 backup-32.gz 从未被解压、从未被挂载、从未被复制
-          - 新 p9 只包含 usb_pure_rootfs/ 的内容
-          - 审计通过：新 p9 /root/ 只有 .bashrc/.profile/.cache/.local
-          - 审计通过：新 p9 全盘无 zip/ext4/img/诊断脚本等残留
+        【构建保证】
+          - p9 rootfs 完全从 Ubuntu Base 构建，与原厂 p9 内容无任何交集
+          - 原厂 backup-32.gz 从未被解压或复制
+          - 5 项构建期审计 + 白名单复制全部通过
 
         【root 账号信息】
           用户名：        root
           初始密码：      ${{ env.ROOT_PASSWORD }}
           ⚠️ 首次登录后请立即执行 passwd root 修改密码！
+
+        【USB 存储支持】
+          U 盘插入后会自动挂载到 /media/sdX1，df -h 可见容量
+          支持格式：FAT32 / exFAT / NTFS / ext4
 
         【刷机包结构（白名单，共 10 个文件）】
           顶层：bootargs.bin, fastboot.bin
@@ -493,10 +454,12 @@ jobs:
           | p8 分区 | `$((P8_SIZE/1024/1024)) MB` |
           | backup-32.gz | `$((B32_SIZE/1024/1024)) MB` |
 
-          ### 构建保证
-          - p9 rootfs 完全从 Ubuntu Base 构建，与原厂 p9 内容无交集
-          - 原厂 backup-32.gz 从未被解压或复制
-          - 5 项构建期审计全部通过
+          ### 功能特性
+          - USB 存储自动挂载（FAT32/exFAT/NTFS/ext4）
+          - 网络 DHCP 自动获取 IP
+          - SSH 远程登录
+          - 国内 NTP 时间同步
+          - UTF-8 locale
 
           ### 账号信息
           - **用户名：** `root`
