@@ -6,6 +6,9 @@
 # lib/rootfs_inner.sh — 在 chroot 内执行的系统配置脚本
 #!/bin/bash
 # lib/rootfs_inner.sh — 在 chroot 内执行的系统配置脚本
+#!/bin/bash
+# lib/rootfs_inner.sh — 在 chroot 内执行的系统配置脚本
+# 兼容 Ubuntu 20.04 (focal) / 22.04 (jammy) / 24.04 (noble)
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 export LC_ALL=C LANG=C
@@ -16,6 +19,7 @@ mount -t tmpfs tmpfs /tmp 2>/dev/null || true
 mkdir -p /var/cache/apt/archives
 mount -t tmpfs tmpfs /var/cache/apt/archives 2>/dev/null || true
 
+# ========== APT 最小化 ==========
 cat > /etc/apt/apt.conf.d/99minimize << 'APTCONF'
 APT::Install-Recommends "false";
 APT::Install-Suggests "false";
@@ -39,16 +43,40 @@ CODENAME="${UBUNTU_CODENAME:-focal}"
 echo "==> Ubuntu 代号: $CODENAME"
 echo "==> 软件源: $MIRROR"
 
-cat > /etc/apt/sources.list << SOURCES
+# ========== 兼容性：APT 源格式 ==========
+# Ubuntu 24.04 (noble) 起默认使用 DEB822 格式
+if [ "$CODENAME" = "noble" ]; then
+    echo "==> 使用 DEB822 格式软件源 (Ubuntu 24.04+)"
+    mkdir -p /etc/apt/sources.list.d
+    cat > /etc/apt/sources.list.d/ubuntu.sources << SOURCES
+Types: deb
+URIs: $MIRROR
+Suites: $CODENAME $CODENAME-updates $CODENAME-backports
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+Types: deb
+URIs: $MIRROR
+Suites: $CODENAME-security
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+SOURCES
+    # 清空传统文件，避免重复/冲突
+    > /etc/apt/sources.list
+else
+    echo "==> 使用传统格式软件源 (Ubuntu 20.04 / 22.04)"
+    cat > /etc/apt/sources.list << SOURCES
 deb $MIRROR $CODENAME main restricted universe multiverse
 deb $MIRROR $CODENAME-updates main restricted universe multiverse
 deb $MIRROR $CODENAME-security main restricted universe multiverse
 deb $MIRROR $CODENAME-backports main restricted universe multiverse
 SOURCES
+fi
 
 apt-get update -qq
 apt-get -f install -y -qq 2>&1 || true
 
+# ========== 安装核心软件包 ==========
 echo "==> 安装核心软件包"
 apt-get install -y -qq --no-install-recommends \
   systemd systemd-sysv systemd-timesyncd dbus udev \
@@ -59,17 +87,13 @@ apt-get install -y -qq --no-install-recommends \
   locales tzdata
 
 # ============================================================
-# 【本轮新增】USB 存储支持
-#   1. 装挂载工具与文件系统支持包（exFAT 必须用 FUSE 版，4.4 内核没内建）
-#   2. 内核模块自动加载配置
-#   3. udev 规则 + systemd 服务 + 挂载脚本（插入自动挂到 /media/sdX1）
+# USB 存储支持（exfat-fuse 在所有目标版本中均可用）
 # ============================================================
 echo "==> USB 存储支持"
 apt-get install -y -qq --no-install-recommends \
   util-linux usbutils \
-  dosfstools ntfs-3g exfat-fuse exfat-utils eject
+  dosfstools ntfs-3g exfat-fuse eject
 
-# 内核模块自动加载（开机 systemd-modules-load 读取）
 cat > /etc/modules-load.d/usb-storage.conf << 'MOD'
 usb-storage
 uas
@@ -80,14 +104,11 @@ nls_utf8
 fuse
 MOD
 
-# udev 规则：分区 add/remove 触发 systemd 挂载服务
 cat > /etc/udev/rules.d/99-usb-storage-mount.rules << 'UDEV'
-# U 盘分区（sd[a-z]后接数字，如 sda1、sdb1）插入时触发挂载
 ACTION=="add", SUBSYSTEM=="block", KERNEL=="sd[a-z][0-9]", ENV{SYSTEMD_WANTS}+="usb-mount@%k.service"
 ACTION=="remove", SUBSYSTEM=="block", KERNEL=="sd[a-z][0-9]", ENV{SYSTEMD_WANTS}+="usb-umount@%k.service"
 UDEV
 
-# 挂载 systemd 模板服务
 cat > /etc/systemd/system/usb-mount@.service << 'SVC'
 [Unit]
 Description=Auto-mount USB block device /dev/%i
@@ -109,7 +130,7 @@ Type=oneshot
 ExecStart=/usr/local/sbin/usb-mount.sh remove %i
 SVC
 
-# 挂载脚本：探测文件系统并挂到 /media/sdX1
+mkdir -p /usr/local/sbin
 cat > /usr/local/sbin/usb-mount.sh << 'SCRIPT'
 #!/bin/bash
 set -euo pipefail
@@ -121,7 +142,7 @@ MOUNT_POINT="/media/$DEV"
 case "$ACTION" in
   add)
     [ -b "$DEV_PATH" ] || exit 0
-    sleep 0.5   # 等分区信息稳定
+    sleep 0.5
     FSTYPE=$(blkid -o value -s TYPE "$DEV_PATH" 2>/dev/null || true)
     [ -z "$FSTYPE" ] && exit 0
     mkdir -p "$MOUNT_POINT"
@@ -130,7 +151,10 @@ case "$ACTION" in
         mount -t vfat -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" || true
         ;;
       exfat)
-        mount -t exfat -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" || true
+        # 4.4 内核无 exfat driver，必须走 FUSE
+        mount.exfat-fuse -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" 2>/dev/null \
+          || mount -t exfat -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" 2>/dev/null \
+          || true
         ;;
       ntfs)
         mount -t ntfs-3g -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" || true
@@ -150,13 +174,12 @@ case "$ACTION" in
 esac
 SCRIPT
 chmod +x /usr/local/sbin/usb-mount.sh
-echo "✅ USB 存储支持已配置（U 盘插入自动挂载到 /media/sdX1）"
-# ============================================================
-# USB 支持段落结束
-# ============================================================
+echo "✅ USB 存储支持已配置"
 
+# ========== 基础系统配置 ==========
 echo "==> 基础系统配置"
 echo "$HOSTNAME" > /etc/hostname
+hostname "$HOSTNAME" 2>/dev/null || true
 cat > /etc/hosts << HOSTS
 127.0.0.1 localhost
 127.0.1.1 $HOSTNAME
@@ -174,6 +197,7 @@ if ! chage -l root 2>/dev/null | grep -q "$TODAY"; then
 fi
 sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
 
+# ========== 网络配置 ==========
 echo "==> 网络配置 (DHCP)"
 mkdir -p /etc/network/interfaces.d
 if [ -n "${CUSTOM_MAC:-}" ]; then
@@ -193,6 +217,7 @@ if ! grep -q 'source /etc/network/interfaces.d/\*' /etc/network/interfaces 2>/de
   echo 'source /etc/network/interfaces.d/*' >> /etc/network/interfaces
 fi
 
+# ========== locale ==========
 echo "==> 生成 locale: $LOCALES"
 locale-gen $LOCALES >/dev/null 2>&1 || true
 cat > /etc/default/locale << 'LOCALE'
@@ -212,8 +237,18 @@ chmod +x /etc/profile.d/zz-locale.sh
 update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 >/dev/null 2>&1 || true
 
 systemd-machine-id-setup 2>/dev/null || true
-rm -f /etc/ssh/ssh_host_*
 
+# ========== SSH 主机密钥重新生成（用正确 hostname 做 comment）==========
+rm -f /etc/ssh/ssh_host_*
+if command -v ssh-keygen >/dev/null 2>&1; then
+  mkdir -p /etc/ssh
+  for _t in rsa ecdsa ed25519; do
+    ssh-keygen -t "$_t" -N '' -f "/etc/ssh/ssh_host_${_t}_key" \
+      -C "root@${HOSTNAME}" -q >/dev/null 2>&1 || true
+  done
+fi
+
+# ========== 服务优化 ==========
 echo "==> 服务优化"
 systemctl enable ssh networking systemd-timesyncd systemd-resolved 2>/dev/null || true
 systemctl mask motd-news.timer motd-news.service 2>/dev/null || true
@@ -227,12 +262,19 @@ NTP=ntp.aliyun.com ntp.tencent.com cn.pool.ntp.org
 FallbackNTP=0.cn.pool.ntp.org 1.cn.pool.ntp.org 2.cn.pool.ntp.org 3.cn.pool.ntp.org
 NTP
 
-mkdir -p /etc/systemd/logind.conf.d
-cat > /etc/systemd/logind.conf.d/99-old-kernel.conf << 'LOGIND'
+# ========== 兼容性：logind 选项仅 systemd >= 247 支持 ==========
+SYSTEMD_VER=$(systemctl --version 2>/dev/null | head -1 | awk '{print $2}' | cut -d. -f1)
+if [ "${SYSTEMD_VER:-0}" -ge 247 ] 2>/dev/null; then
+    echo "==> systemd $SYSTEMD_VER >= 247，写入 logind 兼容配置"
+    mkdir -p /etc/systemd/logind.conf.d
+    cat > /etc/systemd/logind.conf.d/99-old-kernel.conf << 'LOGIND'
 [Login]
 ProtectProc=default
 ProcSubset=all
 LOGIND
+else
+    echo "==> systemd ${SYSTEMD_VER:-未知} < 247，跳过 logind 兼容配置（选项不存在）"
+fi
 
 mkdir -p /etc/systemd/resolved.conf.d
 cat > /etc/systemd/resolved.conf.d/99-dns.conf << 'DNS'
@@ -256,6 +298,7 @@ nameserver 223.5.5.5
 nameserver 223.6.6.6
 RESOLV
 
+# ========== 深度清理 ==========
 echo "==> 深度清理"
 apt-get autoremove -y --purge
 apt-get clean
@@ -291,6 +334,7 @@ rm -f /var/log/*.gz /var/log/*.old /var/log/*.1 2>/dev/null || true
 rm -f /usr/bin/qemu-arm-static
 rm -f /etc/apt/apt.conf.d/99minimize /etc/apt/apt.conf.d/99locale-keep
 
+# ========== 防御性清理 ==========
 find /root -mindepth 1 -maxdepth 1 \
     ! -name '.bashrc' ! -name '.profile' ! -name '.bash_logout' \
     ! -name '.cache' ! -name '.local' \
@@ -304,16 +348,28 @@ for f in /mv100*.zip /www_raw.ext4 /backup-32.gz /sdat2img.py \
 done
 
 echo "========== rootfs 审计 =========="
+echo "--- Ubuntu 代号 ---"
+echo "$CODENAME"
+echo "--- APT 源 ---"
+if [ "$CODENAME" = "noble" ]; then
+    cat /etc/apt/sources.list.d/ubuntu.sources
+else
+    cat /etc/apt/sources.list
+fi
 echo "--- /root ---"
 ls -la /root/
 echo "--- /tmp ---"
 ls -la /tmp/ 2>/dev/null || echo "(empty)"
 echo "--- /home ---"
 ls -la /home/
-echo "--- /etc/default/locale ---"
-cat /etc/default/locale
 echo "--- USB 支持文件 ---"
-ls -la /usr/local/sbin/usb-mount.sh /etc/udev/rules.d/99-usb-storage-mount.rules 2>/dev/null || echo "(MISSING!)"
+ls -la /usr/local/sbin/usb-mount.sh \
+       /etc/udev/rules.d/99-usb-storage-mount.rules \
+       /etc/systemd/system/usb-mount@.service 2>/dev/null || echo "(MISSING!)"
+echo "--- SSH 主机密钥 comment ---"
+for k in /etc/ssh/ssh_host_*_key.pub; do
+  [ -f "$k" ] && ssh-keygen -lf "$k" 2>/dev/null
+done
 echo "========== 审计结束 =========="
 
 echo "✅ Chroot 内配置完成"
