@@ -15,7 +15,13 @@ mount -t tmpfs tmpfs /tmp 2>/dev/null || true
 mkdir -p /var/cache/apt/archives
 mount -t tmpfs tmpfs /var/cache/apt/archives 2>/dev/null || true
 
-# ========== APT 最小化 ==========
+# ============================================================
+# 【关键修复 1】不再排除 /usr/share/i18n/locales/*
+# 原排除项导致 locale-gen 无源可用，setlocale 报 cannot change locale
+# 注意区分：
+#   /usr/share/i18n/locales/*   ← locale 源定义（本处不能排）
+#   /usr/share/locale/*         ← 翻译消息 .mo（可安全排）
+# ============================================================
 cat > /etc/apt/apt.conf.d/99minimize << 'APTCONF'
 APT::Install-Recommends "false";
 APT::Install-Suggests "false";
@@ -26,7 +32,6 @@ DPkg::Options:: "--path-exclude=/usr/share/man/*";
 DPkg::Options:: "--path-exclude=/usr/share/info/*";
 DPkg::Options:: "--path-exclude=/usr/share/lintian/*";
 DPkg::Options:: "--path-exclude=/usr/share/groff/*";
-DPkg::Options:: "--path-exclude=/usr/share/i18n/locales/*";
 APTCONF
 
 cat > /etc/apt/apt.conf.d/99locale-keep << 'LOCCONF'
@@ -181,21 +186,12 @@ ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
 echo "$TIMEZONE" > /etc/timezone
 dpkg-reconfigure -f noninteractive tzdata >/dev/null 2>&1 || true
 
-# ============================================================
-# 【关键修复】root 密码设置
-# 删掉 chage + sed 整段（有 bug：sed 会删掉 shadow 里 root: 前缀）
-# 只用 chpasswd，它本身就会更新 shadow 的 last change date
-# ============================================================
+# ========== root 密码（只用 chpasswd，不用 chage + sed） ==========
 echo "==> 设置 root 密码（长度 ${#ROOT_PASSWORD} 字符）"
 echo "root:$ROOT_PASSWORD" | chpasswd
 sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
 
-# ============================================================
-# 【新增】firstboot-password.service
-# 首次启动时强制重置 root 密码为 CI 输入的值：
-#   - 覆盖 p7 recovery 可能的密码修改
-#   - 时间戳用设备当前时间，修复 "password changed in future"
-# ============================================================
+# ========== firstboot-password.service（首次启动兜底） ==========
 printf '%s\n' "$ROOT_PASSWORD" > /etc/firstboot-pwd.txt
 chmod 600 /etc/firstboot-pwd.txt
 chown root:root /etc/firstboot-pwd.txt
@@ -227,7 +223,7 @@ WantedBy=multi-user.target
 SVC
 
 systemctl enable firstboot-password.service 2>/dev/null || true
-echo "✅ firstboot-password.service 已启用（首次启动强制设置 root 密码）"
+echo "✅ firstboot-password.service 已启用"
 
 # ========== 网络配置 ==========
 echo "==> 网络配置 (DHCP)"
@@ -249,9 +245,36 @@ if ! grep -q 'source /etc/network/interfaces.d/\*' /etc/network/interfaces 2>/de
   echo 'source /etc/network/interfaces.d/*' >> /etc/network/interfaces
 fi
 
-# ========== locale ==========
+# ============================================================
+# 【关键修复 2】locale 生成 + 硬验证
+# 原写法 locale-gen $LOCALES >/dev/null 2>&1 || true 会静默失败，
+# 因为源文件被排除（已修复），现在显式写 /etc/locale.gen 并验证
+# ============================================================
 echo "==> 生成 locale: $LOCALES"
-locale-gen $LOCALES >/dev/null 2>&1 || true
+
+cat > /etc/locale.gen << 'LGEN'
+en_US.UTF-8 UTF-8
+zh_CN.UTF-8 UTF-8
+LGEN
+
+if ! locale-gen; then
+  echo "⚠️  locale-gen 返回非 0"
+fi
+
+for _loc in en_US.UTF-8 zh_CN.UTF-8; do
+  _dir="/usr/lib/locale/$(echo "$_loc" | tr 'A-Z.' 'a-z' | sed 's/utf-8/utf8/')"
+  if [ ! -d "$_dir" ] || [ -z "$(ls -A "$_dir" 2>/dev/null)" ]; then
+    echo "❌ locale 生成失败: $_dir，尝试 localedef 兜底..."
+    mkdir -p "$_dir"
+    if ! localedef -i "$(echo "$_loc" | cut -d. -f1)" -f UTF-8 "$_loc" 2>&1; then
+      echo "❌ localedef 也失败，检查 /usr/share/i18n/locales/"
+      ls -la /usr/share/i18n/locales/ 2>&1 | head -10
+      exit 1
+    fi
+  fi
+  echo "  ✅ $_loc -> $_dir"
+done
+
 cat > /etc/default/locale << 'LOCALE'
 LANG=en_US.UTF-8
 LC_ALL=en_US.UTF-8
@@ -267,6 +290,8 @@ export LC_ALL=en_US.UTF-8
 LOCSH
 chmod +x /etc/profile.d/zz-locale.sh
 update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 >/dev/null 2>&1 || true
+
+echo "✅ locale 生成完成"
 
 systemd-machine-id-setup 2>/dev/null || true
 
@@ -294,7 +319,6 @@ NTP=ntp.aliyun.com ntp.tencent.com cn.pool.ntp.org
 FallbackNTP=0.cn.pool.ntp.org 1.cn.pool.ntp.org 2.cn.pool.ntp.org 3.cn.pool.ntp.org
 NTP
 
-# ========== 兼容性：logind 选项仅 systemd >= 247 支持 ==========
 SYSTEMD_VER=$(systemctl --version 2>/dev/null | head -1 | awk '{print $2}' | cut -d. -f1)
 if [ "${SYSTEMD_VER:-0}" -ge 247 ] 2>/dev/null; then
     echo "==> systemd $SYSTEMD_VER >= 247，写入 logind 兼容配置"
@@ -335,6 +359,7 @@ echo "==> 深度清理"
 apt-get autoremove -y --purge
 apt-get clean
 rm -rf /var/lib/apt/lists/* /var/tmp/* /tmp/* /root/.cache 2>/dev/null || true
+# 注意：不删 /usr/share/i18n —— 它是 locale 重生成的源数据
 rm -rf /usr/share/doc /usr/share/man /usr/share/info \
        /usr/share/lintian /usr/share/linda /usr/share/groff 2>/dev/null || true
 rm -rf /usr/lib/systemd/catalog \
@@ -379,6 +404,7 @@ for f in /mv100*.zip /www_raw.ext4 /backup-32.gz /sdat2img.py \
   rm -f "$f" 2>/dev/null || true
 done
 
+# ========== 审计 ==========
 echo "========== rootfs 审计 =========="
 echo "--- Ubuntu 代号 ---"
 echo "$CODENAME"
@@ -394,6 +420,10 @@ echo "--- /tmp ---"
 ls -la /tmp/ 2>/dev/null || echo "(empty)"
 echo "--- /home ---"
 ls -la /home/
+echo "--- locale 数据（关键）---"
+ls /usr/lib/locale/ 2>/dev/null
+echo "--- locale 源数据（关键）---"
+ls /usr/share/i18n/locales/ 2>/dev/null | head -5
 echo "--- USB 支持文件 ---"
 ls -la /usr/local/sbin/usb-mount.sh \
        /etc/udev/rules.d/99-usb-storage-mount.rules \
