@@ -16,11 +16,7 @@ mkdir -p /var/cache/apt/archives
 mount -t tmpfs tmpfs /var/cache/apt/archives 2>/dev/null || true
 
 # ============================================================
-# 【关键修复 1】不再排除 /usr/share/i18n/locales/*
-# 原排除项导致 locale-gen 无源可用，setlocale 报 cannot change locale
-# 注意区分：
-#   /usr/share/i18n/locales/*   ← locale 源定义（本处不能排）
-#   /usr/share/locale/*         ← 翻译消息 .mo（可安全排）
+# APT 最小化（保留 /usr/share/i18n/locales，供 locale-gen 使用）
 # ============================================================
 cat > /etc/apt/apt.conf.d/99minimize << 'APTCONF'
 APT::Install-Recommends "false";
@@ -44,9 +40,9 @@ CODENAME="${UBUNTU_CODENAME:-focal}"
 echo "==> Ubuntu 代号: $CODENAME"
 echo "==> 软件源: $MIRROR"
 
-# ========== 兼容性：APT 源格式 ==========
+# ========== APT 源格式 ==========
 if [ "$CODENAME" = "noble" ]; then
-    echo "==> 使用 DEB822 格式软件源 (Ubuntu 24.04+)"
+    echo "==> DEB822 格式软件源 (24.04+)"
     mkdir -p /etc/apt/sources.list.d
     cat > /etc/apt/sources.list.d/ubuntu.sources << SOURCES
 Types: deb
@@ -63,7 +59,7 @@ Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 SOURCES
     > /etc/apt/sources.list
 else
-    echo "==> 使用传统格式软件源 (Ubuntu 20.04 / 22.04)"
+    echo "==> 传统格式软件源 (20.04 / 22.04)"
     cat > /etc/apt/sources.list << SOURCES
 deb $MIRROR $CODENAME main restricted universe multiverse
 deb $MIRROR $CODENAME-updates main restricted universe multiverse
@@ -75,7 +71,7 @@ fi
 apt-get update -qq
 apt-get -f install -y -qq 2>&1 || true
 
-# ========== 安装核心软件包 ==========
+# ========== 核心软件包（含 WiFi 脚本依赖）==========
 echo "==> 安装核心软件包"
 apt-get install -y -qq --no-install-recommends \
   systemd systemd-sysv systemd-timesyncd dbus udev \
@@ -83,11 +79,10 @@ apt-get install -y -qq --no-install-recommends \
   openssh-server ssh sudo \
   e2fsprogs ca-certificates \
   vim-tiny less htop wget curl cron rsyslog bash-completion \
-  locales tzdata
+  locales tzdata \
+  file network-manager wpasupplicant iw rfkill
 
-# ============================================================
-# USB 存储支持（exfat-fuse 在所有目标版本中均可用）
-# ============================================================
+# ========== USB 存储支持 ==========
 echo "==> USB 存储支持"
 apt-get install -y -qq --no-install-recommends \
   util-linux usbutils \
@@ -146,23 +141,12 @@ case "$ACTION" in
     [ -z "$FSTYPE" ] && exit 0
     mkdir -p "$MOUNT_POINT"
     case "$FSTYPE" in
-      vfat|fat|msdos)
-        mount -t vfat -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" || true
-        ;;
-      exfat)
-        mount.exfat-fuse -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" 2>/dev/null \
-          || mount -t exfat -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" 2>/dev/null \
-          || true
-        ;;
-      ntfs)
-        mount -t ntfs-3g -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" || true
-        ;;
-      ext4|ext3|ext2)
-        mount -t "$FSTYPE" -o rw "$DEV_PATH" "$MOUNT_POINT" || true
-        ;;
-      *)
-        mount -o rw "$DEV_PATH" "$MOUNT_POINT" 2>/dev/null || true
-        ;;
+      vfat|fat|msdos) mount -t vfat -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" || true ;;
+      exfat) mount.exfat-fuse -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" 2>/dev/null \
+               || mount -t exfat -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" 2>/dev/null || true ;;
+      ntfs) mount -t ntfs-3g -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" || true ;;
+      ext4|ext3|ext2) mount -t "$FSTYPE" -o rw "$DEV_PATH" "$MOUNT_POINT" || true ;;
+      *) mount -o rw "$DEV_PATH" "$MOUNT_POINT" 2>/dev/null || true ;;
     esac
     ;;
   remove)
@@ -186,12 +170,11 @@ ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
 echo "$TIMEZONE" > /etc/timezone
 dpkg-reconfigure -f noninteractive tzdata >/dev/null 2>&1 || true
 
-# ========== root 密码（只用 chpasswd，不用 chage + sed） ==========
+# ========== root 密码 ==========
 echo "==> 设置 root 密码（长度 ${#ROOT_PASSWORD} 字符）"
 echo "root:$ROOT_PASSWORD" | chpasswd
 sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
 
-# ========== firstboot-password.service（首次启动兜底） ==========
 printf '%s\n' "$ROOT_PASSWORD" > /etc/firstboot-pwd.txt
 chmod 600 /etc/firstboot-pwd.txt
 chown root:root /etc/firstboot-pwd.txt
@@ -221,15 +204,38 @@ ExecStart=/usr/local/sbin/firstboot-password.sh
 [Install]
 WantedBy=multi-user.target
 SVC
-
 systemctl enable firstboot-password.service 2>/dev/null || true
 echo "✅ firstboot-password.service 已启用"
 
+# ============================================================
+# 【新增】firstboot-apt-update.service
+# 首次启动后台刷新 apt 索引，防止保留的 lists 过期
+# 如果网络超时或 apt update 失败，不 touch done 标记，下次启动再试
+# ============================================================
+cat > /etc/systemd/system/firstboot-apt-update.service << 'SVC'
+[Unit]
+Description=First boot: refresh apt package lists in background
+ConditionPathExists=!/var/lib/firstboot-apt-update.done
+After=network-online.target networking.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c 'for i in $(seq 1 90); do if ping -c 1 -W 1 223.5.5.5 >/dev/null 2>&1; then break; fi; sleep 1; done; /usr/bin/apt-get update -qq && /bin/touch /var/lib/firstboot-apt-update.done'
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target
+SVC
+systemctl enable firstboot-apt-update.service 2>/dev/null || true
+echo "✅ firstboot-apt-update.service 已启用"
+
 # ========== 网络配置 ==========
-echo "==> 网络配置 (DHCP)"
+echo "==> 网络配置 (eth0: ifupdown / wlan0: NetworkManager)"
 mkdir -p /etc/network/interfaces.d
 if [ -n "${CUSTOM_MAC:-}" ]; then
-  echo "自定义 MAC: $CUSTOM_MAC"
+  echo "自定义 eth0 MAC: $CUSTOM_MAC"
   cat > /etc/network/interfaces.d/eth0 << ETH0
 auto eth0
 iface eth0 inet dhcp
@@ -245,13 +251,20 @@ if ! grep -q 'source /etc/network/interfaces.d/\*' /etc/network/interfaces 2>/de
   echo 'source /etc/network/interfaces.d/*' >> /etc/network/interfaces
 fi
 
-# ============================================================
-# 【关键修复 2】locale 生成 + 硬验证
-# 原写法 locale-gen $LOCALES >/dev/null 2>&1 || true 会静默失败，
-# 因为源文件被排除（已修复），现在显式写 /etc/locale.gen 并验证
-# ============================================================
-echo "==> 生成 locale: $LOCALES"
+mkdir -p /etc/NetworkManager/conf.d
+cat > /etc/NetworkManager/conf.d/99-hinas.conf << 'NMCONF'
+[keyfile]
+unmanaged-devices=interface-name:eth0
 
+[device]
+wifi.scan-rand-mac-address=no
+
+[connection]
+wifi.powersave = 2
+NMCONF
+
+# ========== locale ==========
+echo "==> 生成 locale: $LOCALES"
 cat > /etc/locale.gen << 'LGEN'
 en_US.UTF-8 UTF-8
 zh_CN.UTF-8 UTF-8
@@ -267,7 +280,7 @@ for _loc in en_US.UTF-8 zh_CN.UTF-8; do
     echo "❌ locale 生成失败: $_dir，尝试 localedef 兜底..."
     mkdir -p "$_dir"
     if ! localedef -i "$(echo "$_loc" | cut -d. -f1)" -f UTF-8 "$_loc" 2>&1; then
-      echo "❌ localedef 也失败，检查 /usr/share/i18n/locales/"
+      echo "❌ localedef 也失败"
       ls -la /usr/share/i18n/locales/ 2>&1 | head -10
       exit 1
     fi
@@ -290,12 +303,11 @@ export LC_ALL=en_US.UTF-8
 LOCSH
 chmod +x /etc/profile.d/zz-locale.sh
 update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 >/dev/null 2>&1 || true
-
 echo "✅ locale 生成完成"
 
 systemd-machine-id-setup 2>/dev/null || true
 
-# ========== SSH 主机密钥（用正确 hostname 做 comment）==========
+# ========== SSH 主机密钥 ==========
 rm -f /etc/ssh/ssh_host_*
 if command -v ssh-keygen >/dev/null 2>&1; then
   mkdir -p /etc/ssh
@@ -308,10 +320,27 @@ fi
 # ========== 服务优化 ==========
 echo "==> 服务优化"
 systemctl enable ssh networking systemd-timesyncd systemd-resolved 2>/dev/null || true
+systemctl enable NetworkManager NetworkManager-dispatcher 2>/dev/null || true
 systemctl mask motd-news.timer motd-news.service 2>/dev/null || true
 systemctl mask apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
 systemctl mask dpkg-db-backup.timer 2>/dev/null || true
+systemctl mask networkd-dispatcher 2>/dev/null || true
 systemctl set-default multi-user.target 2>/dev/null || true
+
+cat > /etc/systemd/system/rfkill-unblock-wifi.service << 'SVC'
+[Unit]
+Description=Unblock WiFi via rfkill
+Before=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/rfkill unblock wifi
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+SVC
+systemctl enable rfkill-unblock-wifi.service 2>/dev/null || true
 
 cat > /etc/systemd/timesyncd.conf << 'NTP'
 [Time]
@@ -321,15 +350,12 @@ NTP
 
 SYSTEMD_VER=$(systemctl --version 2>/dev/null | head -1 | awk '{print $2}' | cut -d. -f1)
 if [ "${SYSTEMD_VER:-0}" -ge 247 ] 2>/dev/null; then
-    echo "==> systemd $SYSTEMD_VER >= 247，写入 logind 兼容配置"
     mkdir -p /etc/systemd/logind.conf.d
     cat > /etc/systemd/logind.conf.d/99-old-kernel.conf << 'LOGIND'
 [Login]
 ProtectProc=default
 ProcSubset=all
 LOGIND
-else
-    echo "==> systemd ${SYSTEMD_VER:-未知} < 247，跳过 logind 兼容配置"
 fi
 
 mkdir -p /etc/systemd/resolved.conf.d
@@ -358,8 +384,12 @@ RESOLV
 echo "==> 深度清理"
 apt-get autoremove -y --purge
 apt-get clean
-rm -rf /var/lib/apt/lists/* /var/tmp/* /tmp/* /root/.cache 2>/dev/null || true
-# 注意：不删 /usr/share/i18n —— 它是 locale 重生成的源数据
+
+# 【关键改动】保留 /var/lib/apt/lists/*，这样刷完机可以直接 apt install
+# 只清临时文件和缓存
+rm -rf /var/tmp/* /tmp/* /root/.cache 2>/dev/null || true
+
+# 注意：不删 /usr/share/i18n（locale 源）和 /var/lib/apt/lists（apt 索引）
 rm -rf /usr/share/doc /usr/share/man /usr/share/info \
        /usr/share/lintian /usr/share/linda /usr/share/groff 2>/dev/null || true
 rm -rf /usr/lib/systemd/catalog \
@@ -370,7 +400,7 @@ find /usr/lib -name '*.pyc' -delete 2>/dev/null || true
 
 if [ -d /usr/share/bash-completion/completions ]; then
   cd /usr/share/bash-completion/completions
-  _KEEP="apt apt-get apt-cache dpkg ssh scp systemctl journalctl hostname ip curl wget less vim htop"
+  _KEEP="apt apt-get apt-cache dpkg ssh scp systemctl journalctl hostname ip curl wget less vim htop nmcli"
   for _f in *; do
     _keep=0
     for _k in $_KEEP; do
@@ -414,23 +444,29 @@ if [ "$CODENAME" = "noble" ]; then
 else
     cat /etc/apt/sources.list
 fi
+echo "--- APT lists（关键：应非空，刷完机可直接 apt install）---"
+du -sh /var/lib/apt/lists/ 2>/dev/null || echo "(MISSING!)"
+ls /var/lib/apt/lists/ 2>/dev/null | head -5
 echo "--- /root ---"
 ls -la /root/
 echo "--- /tmp ---"
 ls -la /tmp/ 2>/dev/null || echo "(empty)"
 echo "--- /home ---"
 ls -la /home/
-echo "--- locale 数据（关键）---"
+echo "--- locale 数据 ---"
 ls /usr/lib/locale/ 2>/dev/null
-echo "--- locale 源数据（关键）---"
+echo "--- locale 源数据 ---"
 ls /usr/share/i18n/locales/ 2>/dev/null | head -5
-echo "--- USB 支持文件 ---"
-ls -la /usr/local/sbin/usb-mount.sh \
-       /etc/udev/rules.d/99-usb-storage-mount.rules \
-       /etc/systemd/system/usb-mount@.service 2>/dev/null || echo "(MISSING!)"
-echo "--- firstboot-password 文件 ---"
-ls -la /etc/firstboot-pwd.txt /usr/local/sbin/firstboot-password.sh \
-       /etc/systemd/system/firstboot-password.service 2>/dev/null || echo "(MISSING!)"
+echo "--- WiFi / NM 命令检查 ---"
+for c in file nmtui nmtui-connect nmcli iw rfkill wpa_supplicant; do
+  printf '  %-18s ' "$c"
+  command -v "$c" 2>/dev/null || echo "(MISSING!)"
+done
+echo "--- NetworkManager 配置 ---"
+cat /etc/NetworkManager/conf.d/99-hinas.conf 2>/dev/null
+echo "--- 首次启动服务 ---"
+systemctl is-enabled firstboot-password.service 2>/dev/null || true
+systemctl is-enabled firstboot-apt-update.service 2>/dev/null || true
 echo "--- /etc/shadow 中 root 行（前 30 字符）---"
 grep '^root:' /etc/shadow | cut -c1-30
 echo "--- SSH 主机密钥 comment ---"
