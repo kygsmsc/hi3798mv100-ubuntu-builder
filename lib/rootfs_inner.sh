@@ -1,9 +1,8 @@
-#!/bin/bash
-# lib/rootfs_inner2.sh.sh — 在 chroot 内执行的系统配置脚本（极致精简版）
-# 基于套2优化：保留跨版本兼容性（20.04/22.04/24.04），最大化压缩 rootfs 体积
+#!/bin/bas
 # 所需变量由 common.sh 通过 /usr/bin/env 传入：
 #   MODE MIRROR HOSTNAME ROOT_PASSWORD TIMEZONE LOCALES UBUNTU_CODENAME
-
+# lib/rootfs_inner.sh — 在 chroot 内执行的系统配置脚本
+# 兼容 Ubuntu 20.04 (focal) / 22.04 (jammy) / 24.04 (noble)
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 export LC_ALL=C LANG=C
@@ -34,6 +33,16 @@ DPkg::Options:: "--path-exclude=/usr/share/locale/*";
 DPkg::Options:: "--path-include=/usr/share/locale/en/*";
 DPkg::Options:: "--path-include=/usr/share/locale/zh_CN/*";
 LOCCONF
+
+# 【精简】跳过 DEP-11 (AppStream) 和 Translation，apt lists 只保留 Packages
+# 这个文件不删除，刷机后 apt update 也会自动跳过，持续保持精简
+cat > /etc/apt/apt.conf.d/99-no-translations << 'APTCONF'
+Acquire::IndexTargets::deb::DEP-11::DefaultEnabled "false";
+Acquire::IndexTargets::deb::DEP-11-icons::DefaultEnabled "false";
+Acquire::IndexTargets::deb::DEP-11-icons-small::DefaultEnabled "false";
+Acquire::IndexTargets::deb::DEP-11-icons-large::DefaultEnabled "false";
+Acquire::Languages "none";
+APTCONF
 
 CODENAME="${UBUNTU_CODENAME:-focal}"
 echo "==> Ubuntu 代号: $CODENAME"
@@ -84,11 +93,7 @@ apt-get install -y -qq --no-install-recommends \
   file network-manager wpasupplicant iw rfkill
 
 # ============================================================
-# USB 存储支持
-# 【修复】不再写 /etc/modules-load.d/usb-storage.conf
-#   4.4 内核里 usb-storage / uas / vfat / fuse 都是内建模块
-#   对它们 modprobe 会返回 "module is builtin" 非 0 退出码
-#   导致 systemd-modules-load.service 失败
+# USB 存储支持（不写 modules-load.d，4.4 内核模块全内建）
 # ============================================================
 echo "==> USB 存储支持"
 apt-get install -y -qq --no-install-recommends \
@@ -178,12 +183,11 @@ ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
 echo "$TIMEZONE" > /etc/timezone
 dpkg-reconfigure -f noninteractive tzdata >/dev/null 2>&1 || true
 
-# ========== root 密码（只用 chpasswd） ==========
+# ========== root 密码 ==========
 echo "==> 设置 root 密码（长度 ${#ROOT_PASSWORD} 字符）"
 echo "root:$ROOT_PASSWORD" | chpasswd
 sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
 
-# ========== firstboot-password.service（首次启动兜底） ==========
 printf '%s\n' "$ROOT_PASSWORD" > /etc/firstboot-pwd.txt
 chmod 600 /etc/firstboot-pwd.txt
 chown root:root /etc/firstboot-pwd.txt
@@ -216,7 +220,7 @@ SVC
 systemctl enable firstboot-password.service 2>/dev/null || true
 echo "✅ firstboot-password.service 已启用"
 
-# ========== firstboot-apt-update.service（首次启动后台刷新 apt lists） ==========
+# ========== firstboot-apt-update.service ==========
 cat > /etc/systemd/system/firstboot-apt-update.service << 'SVC'
 [Unit]
 Description=First boot: refresh apt package lists in background
@@ -353,12 +357,7 @@ NTP=ntp.aliyun.com ntp.tencent.com cn.pool.ntp.org
 FallbackNTP=0.cn.pool.ntp.org 1.cn.pool.ntp.org 2.cn.pool.ntp.org 3.cn.pool.ntp.org
 NTP
 
-# ============================================================
-# 【修复】logind + system 老内核兼容
-#   logind.conf.d  → 消除 logind 自身的 hidepid=invisible 警告
-#   system.conf.d  → 全局 DefaultProtectProc=default
-#                    消除 systemd-journald / systemd-userdbd 等所有 unit 的同类警告
-# ============================================================
+# logind + system 老内核兼容
 SYSTEMD_VER=$(systemctl --version 2>/dev/null | head -1 | awk '{print $2}' | cut -d. -f1)
 if [ "${SYSTEMD_VER:-0}" -ge 247 ] 2>/dev/null; then
     echo "==> systemd $SYSTEMD_VER >= 247，写入 logind + system 兼容配置"
@@ -400,15 +399,40 @@ nameserver 223.5.5.5
 nameserver 223.6.6.6
 RESOLV
 
+# ============================================================
+# 【精简 A 级·零影响】移除/清理不影响功能的文件
+# ============================================================
+echo "==> 精简 A 级（零影响）"
+# consolefonts: 物理 console 字体，SSH/串口不依赖
+rm -rf /usr/share/consolefonts 2>/dev/null || true
+# keymaps: 物理 console 键盘布局，SSH/串口不依赖
+rm -rf /usr/share/keymaps 2>/dev/null || true
+# hwdb.bin: udev 硬件数据库，删除后 udev 降级运行
+rm -f /etc/udev/hwdb.bin 2>/dev/null || true
+# eject: 光驱弹出，无用
+apt-get remove --purge -y eject 2>/dev/null || true
+# dpkg md5sums: 只有 dpkg -V 用，日常不用
+rm -f /var/lib/dpkg/info/*.md5sums 2>/dev/null || true
+# dpkg 的 .triggers/.shlibs 已无实际用途
+find /var/lib/dpkg/info -name '*.triggers' -delete 2>/dev/null || true
+
+# ============================================================
+# 【精简 B 级·可选】仅在 MINIMAL_MODE=yes 时执行
+# ============================================================
+if [ "${MINIMAL_MODE:-no}" = "yes" ]; then
+    echo "==> 精简 B 级（移除 htop / bash-completion）"
+    apt-get remove --purge -y htop bash-completion 2>/dev/null || true
+    # 清理被移除包留下的空目录
+    rm -rf /usr/share/bash-completion 2>/dev/null || true
+fi
+
 # ========== 深度清理 ==========
 echo "==> 深度清理"
 apt-get autoremove -y --purge
 apt-get clean
 
-# 【保留 /var/lib/apt/lists/*】刷完机可直接 apt install，无需先 apt update
+# 保留 /var/lib/apt/lists/*（配合 99-no-translations 已精简）
 rm -rf /var/tmp/* /tmp/* /root/.cache 2>/dev/null || true
-
-# 不删 /usr/share/i18n（locale 源）和 /var/lib/apt/lists（apt 索引）
 rm -rf /usr/share/doc /usr/share/man /usr/share/info \
        /usr/share/lintian /usr/share/linda /usr/share/groff 2>/dev/null || true
 rm -rf /usr/lib/systemd/catalog \
@@ -439,6 +463,7 @@ rm -f /var/log/*.gz /var/log/*.old /var/log/*.1 2>/dev/null || true
 
 rm -f /usr/bin/qemu-arm-static
 rm -f /etc/apt/apt.conf.d/99minimize /etc/apt/apt.conf.d/99locale-keep
+# 【注意】99-no-translations 保留不删，刷机后 apt update 仍跳过 DEP-11
 
 # ========== 防御性清理 ==========
 find /root -mindepth 1 -maxdepth 1 \
@@ -463,9 +488,9 @@ if [ "$CODENAME" = "noble" ]; then
 else
     cat /etc/apt/sources.list
 fi
-echo "--- APT lists（应非空，刷完机可直接 apt install）---"
+echo "--- APT lists（应非空且不含 DEP-11/Translation）---"
 du -sh /var/lib/apt/lists/ 2>/dev/null || echo "(MISSING!)"
-ls /var/lib/apt/lists/ 2>/dev/null | head -5
+ls /var/lib/apt/lists/ 2>/dev/null | head -8
 echo "--- /root ---"
 ls -la /root/
 echo "--- /tmp ---"
@@ -481,15 +506,27 @@ for c in file nmtui nmtui-connect nmcli iw rfkill wpa_supplicant; do
   printf '  %-18s ' "$c"
   command -v "$c" 2>/dev/null || echo "(MISSING!)"
 done
-echo "--- NetworkManager 配置 ---"
-cat /etc/NetworkManager/conf.d/99-hinas.conf 2>/dev/null
+echo "--- 编辑器检查 ---"
+for c in vim vi nano; do
+  printf '  %-18s ' "$c"
+  command -v "$c" 2>/dev/null || echo "(MISSING!)"
+done
+echo "--- 精简 A 级验证（这些应该都不存在）---"
+for p in /usr/share/consolefonts /usr/share/keymaps /etc/udev/hwdb.bin; do
+  if [ -e "$p" ]; then
+    echo "  ❌ $p 仍存在"
+  else
+    echo "  ✅ $p 已清除"
+  fi
+done
+echo "--- apt 精简配置 ---"
+ls -la /etc/apt/apt.conf.d/99-no-translations 2>/dev/null || echo "(MISSING!)"
 echo "--- 首次启动服务 ---"
 systemctl is-enabled firstboot-password.service 2>/dev/null || true
 systemctl is-enabled firstboot-apt-update.service 2>/dev/null || true
 echo "--- logind / system 兼容配置 ---"
-ls -la /etc/systemd/logind.conf.d/ 2>/dev/null
-ls -la /etc/systemd/system.conf.d/ 2>/dev/null
-echo "--- modules-load.d（应为空，避免内建模块 modprobe 报错）---"
+ls /etc/systemd/logind.conf.d/ /etc/systemd/system.conf.d/ 2>/dev/null
+echo "--- modules-load.d（应为空）---"
 ls -la /etc/modules-load.d/ 2>/dev/null
 echo "--- /etc/shadow 中 root 行（前 30 字符）---"
 grep '^root:' /etc/shadow | cut -c1-30
@@ -497,6 +534,8 @@ echo "--- SSH 主机密钥 comment ---"
 for k in /etc/ssh/ssh_host_*_key.pub; do
   [ -f "$k" ] && ssh-keygen -lf "$k" 2>/dev/null
 done
+echo "--- rootfs 总体积 ---"
+du -sh /
 echo "========== 审计结束 =========="
 
 echo "✅ Chroot 内配置完成"
