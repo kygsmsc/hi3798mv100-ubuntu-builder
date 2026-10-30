@@ -3,7 +3,9 @@
 #   MODE MIRROR HOSTNAME ROOT_PASSWORD TIMEZONE LOCALES UBUNTU_CODENAME
 # lib/rootfs_inner.sh — 在 chroot 内执行的系统配置脚本
 # 兼容 Ubuntu 20.04 (focal) / 22.04 (jammy) / 24.04 (noble)
-
+#!/bin/bash
+# lib/rootfs_inner.sh — 在 chroot 内执行的系统配置脚本
+# 兼容 Ubuntu 20.04 (focal) / 22.04 (jammy) / 24.04 (noble)
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 export LC_ALL=C LANG=C
@@ -48,6 +50,7 @@ CODENAME="${UBUNTU_CODENAME:-focal}"
 echo "==> Ubuntu 代号: $CODENAME"
 echo "==> 软件源: $MIRROR"
 
+# ========== APT 源格式 ==========
 if [ "$CODENAME" = "noble" ]; then
     echo "==> DEB822 格式软件源 (24.04+)"
     mkdir -p /etc/apt/sources.list.d
@@ -89,7 +92,7 @@ apt-get install -y -qq --no-install-recommends \
   locales tzdata \
   file network-manager wpasupplicant iw rfkill
 
-# ========== USB 存储支持 ==========
+# ========== USB 存储支持（不写 modules-load.d） ==========
 echo "==> USB 存储支持"
 apt-get install -y -qq --no-install-recommends \
   util-linux usbutils \
@@ -183,56 +186,40 @@ echo "==> 设置 root 密码（长度 ${#ROOT_PASSWORD} 字符）"
 echo "root:$ROOT_PASSWORD" | chpasswd
 sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
 
-# ========== firstboot-password（铁壁版） ==========
+# ========== firstboot-password.service（旧版 .done 判据） ==========
 printf '%s\n' "$ROOT_PASSWORD" > /etc/firstboot-pwd.txt
 chmod 600 /etc/firstboot-pwd.txt
 chown root:root /etc/firstboot-pwd.txt
 
 cat > /usr/local/sbin/firstboot-password.sh << 'SH'
 #!/bin/bash
-# 唯一判据：/etc/firstboot-pwd.txt 存在则执行，成功后立即删除
-# 用 printf + cat 组合，避免 echo 展开密码里的特殊字符
 [ -f /etc/firstboot-pwd.txt ] || exit 0
-
-{
-    printf 'root:'
-    cat /etc/firstboot-pwd.txt
-} | chpasswd
-
+PWD=$(cat /etc/firstboot-pwd.txt)
+echo "root:$PWD" | chpasswd
 chage -d "$(date +%Y-%m-%d)" root 2>/dev/null || true
-
 rm -f /etc/firstboot-pwd.txt
 touch /var/lib/firstboot-password.done
-
-echo "firstboot-password: root password reset done at $(date)" \
-    | systemd-cat -t firstboot-password 2>/dev/null || true
 SH
 chmod +x /usr/local/sbin/firstboot-password.sh
 
 cat > /etc/systemd/system/firstboot-password.service << 'SVC'
 [Unit]
 Description=First boot: force reset root password
-ConditionPathExists=/etc/firstboot-pwd.txt
-After=local-fs.target
-Before=ssh.service getty.target serial-getty@ttyAMA0.service
-DefaultDependencies=no
+ConditionPathExists=!/var/lib/firstboot-password.done
+Before=ssh.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/sbin/firstboot-password.sh
-TimeoutStartSec=60
-StandardOutput=journal
-StandardError=journal
 
 [Install]
-WantedBy=sysinit.target
+WantedBy=multi-user.target
 SVC
-
 systemctl enable firstboot-password.service 2>/dev/null || true
-echo "✅ firstboot-password.service 已启用（条件：/etc/firstboot-pwd.txt 存在）"
+echo "✅ firstboot-password.service 已启用"
 
-# ========== firstboot-apt-update ==========
+# ========== firstboot-apt-update.service ==========
 cat > /etc/systemd/system/firstboot-apt-update.service << 'SVC'
 [Unit]
 Description=First boot: refresh apt package lists in background
@@ -369,6 +356,7 @@ NTP=ntp.aliyun.com ntp.tencent.com cn.pool.ntp.org
 FallbackNTP=0.cn.pool.ntp.org 1.cn.pool.ntp.org 2.cn.pool.ntp.org 3.cn.pool.ntp.org
 NTP
 
+# ========== logind + system 老内核兼容 ==========
 SYSTEMD_VER=$(systemctl --version 2>/dev/null | head -1 | awk '{print $2}' | cut -d. -f1)
 if [ "${SYSTEMD_VER:-0}" -ge 247 ] 2>/dev/null; then
     echo "==> systemd $SYSTEMD_VER >= 247，写入 logind + system 兼容配置"
@@ -410,9 +398,7 @@ nameserver 223.5.5.5
 nameserver 223.6.6.6
 RESOLV
 
-# ============================================================
-# 深度清理（先执行，再做精简，保证 apt 操作和精简分离）
-# ============================================================
+# ========== 深度清理（保留 apt lists） ==========
 echo "==> 深度清理"
 apt-get autoremove -y --purge
 apt-get clean
@@ -449,41 +435,6 @@ rm -f /var/log/*.gz /var/log/*.old /var/log/*.1 2>/dev/null || true
 
 rm -f /usr/bin/qemu-arm-static
 rm -f /etc/apt/apt.conf.d/99minimize /etc/apt/apt.conf.d/99locale-keep
-# 99-no-translations 保留不删（刷机后 apt update 仍跳过 DEP-11）
-
-# ============================================================
-# 【修复】精简 A 级（零影响）——只删文件，不做任何 apt 操作
-# 原因：精简版之前的代码里 apt-get remove eject 打断了 systemd enable 状态，
-#       导致 firstboot-password 在首次启动未执行。改成纯文件删除。
-# ============================================================
-echo "==> 精简 A 级（零影响，纯文件删除，不涉及 apt）"
-rm -rf /usr/share/consolefonts 2>/dev/null || true
-rm -rf /usr/share/keymaps 2>/dev/null || true
-rm -f /etc/udev/hwdb.bin 2>/dev/null || true
-# 【注意】不执行 apt-get remove --purge eject
-# eject 仅 1MB，保留；apt 操作可能影响 systemd enable 状态
-# 【注意】不删除 /var/lib/dpkg/info/*.md5sums 和 *.triggers
-# 这些元数据删除后可能导致 dpkg 状态不一致，间接影响 systemd 服务 enable
-
-# ============================================================
-# 【可选】精简 B 级（MINIMAL_MODE=yes 时执行，纯文件删除）
-# ============================================================
-if [ "${MINIMAL_MODE:-no}" = "yes" ]; then
-    echo "==> 精简 B 级（纯文件删除，不做 apt 操作）"
-    rm -rf /usr/bin/htop 2>/dev/null || true
-    rm -rf /usr/share/bash-completion 2>/dev/null || true
-    echo "  (htop 和 bash-completion 已移除，用 top 替代 htop)"
-fi
-
-# ============================================================
-# 【关键修复】精简后再重新 enable 所有 firstboot 相关服务
-# 保证 systemd 符号链接不会被任何精简操作意外清理
-# ============================================================
-echo "==> 重新 enable firstboot 服务（保证精简后符号链接存在）"
-systemctl enable firstboot-password.service 2>/dev/null || true
-systemctl enable firstboot-apt-update.service 2>/dev/null || true
-systemctl enable ssh networking NetworkManager systemd-timesyncd systemd-resolved 2>/dev/null || true
-systemctl enable rfkill-unblock-wifi.service 2>/dev/null || true
 
 # ========== 防御性清理 ==========
 find /root -mindepth 1 -maxdepth 1 \
@@ -508,7 +459,7 @@ if [ "$CODENAME" = "noble" ]; then
 else
     cat /etc/apt/sources.list
 fi
-echo "--- APT lists（应非空且不含 DEP-11/Translation）---"
+echo "--- APT lists（应非空）---"
 du -sh /var/lib/apt/lists/ 2>/dev/null || echo "(MISSING!)"
 echo "--- /root ---"
 ls -la /root/
@@ -523,36 +474,26 @@ for c in file nmtui nmtui-connect nmcli iw rfkill wpa_supplicant; do
   printf '  %-18s ' "$c"
   command -v "$c" 2>/dev/null || echo "(MISSING!)"
 done
-echo "--- firstboot-password 文件（关键）---"
+echo "--- firstboot-password 文件 ---"
 echo -n "  /etc/firstboot-pwd.txt: "
 if [ -f /etc/firstboot-pwd.txt ]; then
-    echo -n "存在 (size=$(stat -c%s /etc/firstboot-pwd.txt) bytes, "
-    echo "perm=$(stat -c%a /etc/firstboot-pwd.txt))"
+    echo "存在 (size=$(stat -c%s /etc/firstboot-pwd.txt) bytes)"
 else
-    echo "❌ 不存在！首次启动不会重置密码！"
+    echo "❌ 不存在"
 fi
 echo -n "  /usr/local/sbin/firstboot-password.sh: "
-[ -x /usr/local/sbin/firstboot-password.sh ] && echo "存在且可执行" || echo "❌ 缺失或不可执行"
-echo -n "  /etc/systemd/system/firstboot-password.service: "
-[ -f /etc/systemd/system/firstboot-password.service ] && echo "存在" || echo "❌ 缺失"
+[ -x /usr/local/sbin/firstboot-password.sh ] && echo "存在且可执行" || echo "❌"
 echo -n "  systemd enable 状态: "
 systemctl is-enabled firstboot-password.service 2>/dev/null || echo "❌ 未 enable"
-echo "  符号链接位置:"
-ls -la /etc/systemd/system/sysinit.target.wants/firstboot-password.service 2>/dev/null || echo "  ❌ 符号链接不存在"
-echo "--- firstboot-password.service 内容 ---"
-cat /etc/systemd/system/firstboot-password.service
+echo "--- logind / system 兼容配置 ---"
+ls /etc/systemd/logind.conf.d/ /etc/systemd/system.conf.d/ 2>/dev/null
+echo "--- modules-load.d（应为空）---"
+ls -la /etc/modules-load.d/ 2>/dev/null
 echo "--- /etc/shadow 中 root 行（前 30 字符）---"
 grep '^root:' /etc/shadow | cut -c1-30
 echo "--- SSH 主机密钥 comment ---"
 for k in /etc/ssh/ssh_host_*_key.pub; do
   [ -f "$k" ] && ssh-keygen -lf "$k" 2>/dev/null
-done
-echo "--- rootfs 各目录体积 ---"
-for d in /usr /etc /var /opt /home /root /lib /lib64 /bin /sbin /boot; do
-    if [ -e "$d" ]; then
-        sz=$(du -sh "$d" 2>/dev/null | awk '{print $1}')
-        printf '  %-8s %s\n' "$sz" "$d"
-    fi
 done
 echo "--- rootfs 总计（不含 proc/sys/dev/run/tmp）---"
 du -sh --exclude=/proc --exclude=/sys --exclude=/dev --exclude=/run --exclude=/tmp / 2>/dev/null | awk '{print "  " $1 "  总计"}' || true
