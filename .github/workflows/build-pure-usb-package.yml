@@ -25,7 +25,11 @@ on:
       root_password:
         description: 'root 登录密码（生产环境务必修改）'
         required: false
-        default: 'root123'
+        default: 'root12
+      minimal_mode:
+        description: '精简模式（yes = 额外移除 htop/bash-completion，省 ~4MB）'
+        required: false
+        default: 'no'
       p9_size_mb:
         description: 'p9 rootfs ext4 初始大小（MB）。原厂约 828MB，默认 1024MB 留冗余'
         required: false
@@ -63,6 +67,7 @@ jobs:
       ROOT_PASSWORD: ${{ inputs.root_password || 'root123' }}
       P9_SIZE_MB: ${{ inputs.p9_size_mb || '1024' }}
       CUSTOM_MAC: ${{ inputs.custom_mac || '' }}
+      MINIMAL_MODE: ${{ inputs.minimal_mode || 'no' }}
 
     steps:
     - name: 1. 检出代码
