@@ -534,8 +534,13 @@ echo "--- SSH 主机密钥 comment ---"
 for k in /etc/ssh/ssh_host_*_key.pub; do
   [ -f "$k" ] && ssh-keygen -lf "$k" 2>/dev/null
 done
-echo "--- rootfs 总体积 ---"
-du -sh /
+echo "--- rootfs 各目录体积 ---"
+for d in /usr /etc /var /opt /home /root /lib /lib64 /bin /sbin /boot; do
+    if [ -e "$d" ]; then
+        sz=$(du -sh "$d" 2>/dev/null | awk '{print $1}')
+        printf '  %-8s %s\n' "$sz" "$d"
+    fi
+done
+echo "--- rootfs 总计（不含 proc/sys/dev/run/tmp）---"
+du -sh --exclude=/proc --exclude=/sys --exclude=/dev --exclude=/run --exclude=/tmp / 2>/dev/null | awk '{print "  " $1 "  总计"}' || true
 echo "========== 审计结束 =========="
-
-echo "✅ Chroot 内配置完成"
