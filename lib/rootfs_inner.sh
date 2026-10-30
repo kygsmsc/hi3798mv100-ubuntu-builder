@@ -3,7 +3,9 @@
 #   MODE MIRROR HOSTNAME ROOT_PASSWORD TIMEZONE LOCALES UBUNTU_CODENAME
 # lib/rootfs_inner.sh — 在 chroot 内执行的系统配置脚本
 # 兼容 Ubuntu 20.04 (focal) / 22.04 (jammy) / 24.04 (noble)
-
+#!/bin/bash
+# lib/rootfs_inner.sh — 在 chroot 内执行的系统配置脚本
+# 兼容 Ubuntu 20.04 (focal) / 22.04 (jammy) / 24.04 (noble)
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 export LC_ALL=C LANG=C
@@ -70,7 +72,13 @@ fi
 apt-get update -qq
 apt-get -f install -y -qq 2>&1 || true
 
-# ========== 核心软件包（含 WiFi 脚本依赖）==========
+# ============================================================
+# 【改动 1】核心包列表加 file / network-manager / wpasupplicant / iw / rfkill
+#   file            → hinaswifi.sh 判断驱动包类型
+#   network-manager → 提供 nmtui / nmtui-connect / nmcli
+#   wpasupplicant   → NM 连接加密 WiFi 必需
+#   iw / rfkill     → 调试 WiFi 与解除软屏蔽
+# ============================================================
 echo "==> 安装核心软件包"
 apt-get install -y -qq --no-install-recommends \
   systemd systemd-sysv systemd-timesyncd dbus udev \
@@ -207,30 +215,12 @@ systemctl enable firstboot-password.service 2>/dev/null || true
 echo "✅ firstboot-password.service 已启用"
 
 # ============================================================
-# 【新增】firstboot-apt-update.service
-# 首次启动后台刷新 apt 索引，防止保留的 lists 过期
-# 如果网络超时或 apt update 失败，不 touch done 标记，下次启动再试
+# 【改动 2】网络配置
+#   - eth0 继续由 ifupdown 管理（DHCP 已验证可用）
+#   - wlan0 由 NetworkManager 管理（供 nmtui-connect 使用）
+#   - NM 显式不接管 eth0，避免与 ifupdown 冲突
+#   - 关闭 WiFi 省电、禁用扫描 MAC 随机化（连接更稳）
 # ============================================================
-cat > /etc/systemd/system/firstboot-apt-update.service << 'SVC'
-[Unit]
-Description=First boot: refresh apt package lists in background
-ConditionPathExists=!/var/lib/firstboot-apt-update.done
-After=network-online.target networking.service
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/bin/bash -c 'for i in $(seq 1 90); do if ping -c 1 -W 1 223.5.5.5 >/dev/null 2>&1; then break; fi; sleep 1; done; /usr/bin/apt-get update -qq && /bin/touch /var/lib/firstboot-apt-update.done'
-TimeoutStartSec=600
-
-[Install]
-WantedBy=multi-user.target
-SVC
-systemctl enable firstboot-apt-update.service 2>/dev/null || true
-echo "✅ firstboot-apt-update.service 已启用"
-
-# ========== 网络配置 ==========
 echo "==> 网络配置 (eth0: ifupdown / wlan0: NetworkManager)"
 mkdir -p /etc/network/interfaces.d
 if [ -n "${CUSTOM_MAC:-}" ]; then
@@ -252,12 +242,15 @@ fi
 
 mkdir -p /etc/NetworkManager/conf.d
 cat > /etc/NetworkManager/conf.d/99-hinas.conf << 'NMCONF'
+# eth0 交给 ifupdown，NM 不碰
 [keyfile]
 unmanaged-devices=interface-name:eth0
 
+# 关闭 WiFi 扫描 MAC 随机化（避免路由器 DHCP 每次分配新 IP）
 [device]
 wifi.scan-rand-mac-address=no
 
+# 2 = 关闭 WiFi 省电，连接更稳定
 [connection]
 wifi.powersave = 2
 NMCONF
@@ -279,7 +272,7 @@ for _loc in en_US.UTF-8 zh_CN.UTF-8; do
     echo "❌ locale 生成失败: $_dir，尝试 localedef 兜底..."
     mkdir -p "$_dir"
     if ! localedef -i "$(echo "$_loc" | cut -d. -f1)" -f UTF-8 "$_loc" 2>&1; then
-      echo "❌ localedef 也失败"
+      echo "❌ localedef 也失败，检查 /usr/share/i18n/locales/"
       ls -la /usr/share/i18n/locales/ 2>&1 | head -10
       exit 1
     fi
@@ -316,16 +309,20 @@ if command -v ssh-keygen >/dev/null 2>&1; then
   done
 fi
 
-# ========== 服务优化 ==========
+# ============================================================
+# 【改动 3】服务优化：启用 NM + rfkill unblock
+# ============================================================
 echo "==> 服务优化"
 systemctl enable ssh networking systemd-timesyncd systemd-resolved 2>/dev/null || true
 systemctl enable NetworkManager NetworkManager-dispatcher 2>/dev/null || true
 systemctl mask motd-news.timer motd-news.service 2>/dev/null || true
 systemctl mask apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
 systemctl mask dpkg-db-backup.timer 2>/dev/null || true
+# 装 NM 可能重新启用 networkd-dispatcher，重新 mask
 systemctl mask networkd-dispatcher 2>/dev/null || true
 systemctl set-default multi-user.target 2>/dev/null || true
 
+# 开机解除 WiFi 软屏蔽（rfkill）
 cat > /etc/systemd/system/rfkill-unblock-wifi.service << 'SVC'
 [Unit]
 Description=Unblock WiFi via rfkill
@@ -383,12 +380,7 @@ RESOLV
 echo "==> 深度清理"
 apt-get autoremove -y --purge
 apt-get clean
-
-# 【关键改动】保留 /var/lib/apt/lists/*，这样刷完机可以直接 apt install
-# 只清临时文件和缓存
-rm -rf /var/tmp/* /tmp/* /root/.cache 2>/dev/null || true
-
-# 注意：不删 /usr/share/i18n（locale 源）和 /var/lib/apt/lists（apt 索引）
+rm -rf /var/lib/apt/lists/* /var/tmp/* /tmp/* /root/.cache 2>/dev/null || true
 rm -rf /usr/share/doc /usr/share/man /usr/share/info \
        /usr/share/lintian /usr/share/linda /usr/share/groff 2>/dev/null || true
 rm -rf /usr/lib/systemd/catalog \
@@ -433,7 +425,9 @@ for f in /mv100*.zip /www_raw.ext4 /backup-32.gz /sdat2img.py \
   rm -f "$f" 2>/dev/null || true
 done
 
-# ========== 审计 ==========
+# ============================================================
+# 【改动 4】审计段：确认 WiFi 相关命令存在
+# ============================================================
 echo "========== rootfs 审计 =========="
 echo "--- Ubuntu 代号 ---"
 echo "$CODENAME"
@@ -443,9 +437,6 @@ if [ "$CODENAME" = "noble" ]; then
 else
     cat /etc/apt/sources.list
 fi
-echo "--- APT lists（关键：应非空，刷完机可直接 apt install）---"
-du -sh /var/lib/apt/lists/ 2>/dev/null || echo "(MISSING!)"
-ls /var/lib/apt/lists/ 2>/dev/null | head -5
 echo "--- /root ---"
 ls -la /root/
 echo "--- /tmp ---"
@@ -462,10 +453,18 @@ for c in file nmtui nmtui-connect nmcli iw rfkill wpa_supplicant; do
   command -v "$c" 2>/dev/null || echo "(MISSING!)"
 done
 echo "--- NetworkManager 配置 ---"
+ls -la /etc/NetworkManager/conf.d/ 2>/dev/null
 cat /etc/NetworkManager/conf.d/99-hinas.conf 2>/dev/null
-echo "--- 首次启动服务 ---"
-systemctl is-enabled firstboot-password.service 2>/dev/null || true
-systemctl is-enabled firstboot-apt-update.service 2>/dev/null || true
+echo "--- NetworkManager 服务 ---"
+systemctl is-enabled NetworkManager 2>/dev/null || true
+systemctl is-enabled rfkill-unblock-wifi.service 2>/dev/null || true
+echo "--- USB 支持文件 ---"
+ls -la /usr/local/sbin/usb-mount.sh \
+       /etc/udev/rules.d/99-usb-storage-mount.rules \
+       /etc/systemd/system/usb-mount@.service 2>/dev/null || echo "(MISSING!)"
+echo "--- firstboot-password 文件 ---"
+ls -la /etc/firstboot-pwd.txt /usr/local/sbin/firstboot-password.sh \
+       /etc/systemd/system/firstboot-password.service 2>/dev/null || echo "(MISSING!)"
 echo "--- /etc/shadow 中 root 行（前 30 字符）---"
 grep '^root:' /etc/shadow | cut -c1-30
 echo "--- SSH 主机密钥 comment ---"
