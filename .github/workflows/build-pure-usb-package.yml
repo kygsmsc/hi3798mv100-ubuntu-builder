@@ -38,13 +38,13 @@ on:
         description: '自定义 eth0 MAC（留空则用设备原生。多设备场景每台设不同值）'
         required: false
         default: ''
-  push:
-    branches: [ main ]
-    paths:
-      - 'build_rootfs.sh'
-      - 'build_usb_rootfs.sh'
-      - 'lib/**'
-      - '.github/workflows/**'
+  #push:
+  #  branches: [ main ]
+  #  paths:
+  #   - 'build_rootfs.sh'
+  #   - 'build_usb_rootfs.sh'
+  #   - 'lib/**'
+  #   - '.github/workflows/**'
 
 concurrency:
   group: build-usb-${{ github.ref }}
