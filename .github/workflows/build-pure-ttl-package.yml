@@ -23,13 +23,6 @@ on:
         description: 'root 登录密码（生产环境务必修改）'
         required: false
         default: 'root123'
-  push:
-    branches: [ main ]
-    paths:
-      - 'build_rootfs.sh'
-      - 'build_usb_rootfs.sh'
-      - 'lib/**'
-      - '.github/workflows/**'
 
 concurrency:
   group: build-ttl-${{ github.ref }}
