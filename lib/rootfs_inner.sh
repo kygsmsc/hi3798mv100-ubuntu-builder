@@ -3,9 +3,7 @@
 #   MODE MIRROR HOSTNAME ROOT_PASSWORD TIMEZONE LOCALES UBUNTU_CODENAME
 # lib/rootfs_inner.sh — 在 chroot 内执行的系统配置脚本
 # 兼容 Ubuntu 20.04 (focal) / 22.04 (jammy) / 24.04 (noble)
-#!/bin/bash
-# lib/rootfs_inner.sh — 在 chroot 内执行的系统配置脚本
-# 兼容 Ubuntu 20.04 (focal) / 22.04 (jammy) / 24.04 (noble)
+
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 export LC_ALL=C LANG=C
@@ -36,6 +34,15 @@ DPkg::Options:: "--path-exclude=/usr/share/locale/*";
 DPkg::Options:: "--path-include=/usr/share/locale/en/*";
 DPkg::Options:: "--path-include=/usr/share/locale/zh_CN/*";
 LOCCONF
+
+# 跳过 DEP-11 和 Translation，apt lists 只保留 Packages
+cat > /etc/apt/apt.conf.d/99-no-translations << 'APTCONF'
+Acquire::IndexTargets::deb::DEP-11::DefaultEnabled "false";
+Acquire::IndexTargets::deb::DEP-11-icons::DefaultEnabled "false";
+Acquire::IndexTargets::deb::DEP-11-icons-small::DefaultEnabled "false";
+Acquire::IndexTargets::deb::DEP-11-icons-large::DefaultEnabled "false";
+Acquire::Languages "none";
+APTCONF
 
 CODENAME="${UBUNTU_CODENAME:-focal}"
 echo "==> Ubuntu 代号: $CODENAME"
@@ -72,13 +79,7 @@ fi
 apt-get update -qq
 apt-get -f install -y -qq 2>&1 || true
 
-# ============================================================
-# 【改动 1】核心包列表加 file / network-manager / wpasupplicant / iw / rfkill
-#   file            → hinaswifi.sh 判断驱动包类型
-#   network-manager → 提供 nmtui / nmtui-connect / nmcli
-#   wpasupplicant   → NM 连接加密 WiFi 必需
-#   iw / rfkill     → 调试 WiFi 与解除软屏蔽
-# ============================================================
+# ========== 核心软件包 ==========
 echo "==> 安装核心软件包"
 apt-get install -y -qq --no-install-recommends \
   systemd systemd-sysv systemd-timesyncd dbus udev \
@@ -89,21 +90,13 @@ apt-get install -y -qq --no-install-recommends \
   locales tzdata \
   file network-manager wpasupplicant iw rfkill
 
-# ========== USB 存储支持 ==========
+# ============================================================
+# USB 存储支持（不写 modules-load.d，4.4 内核模块全内建）
+# ============================================================
 echo "==> USB 存储支持"
 apt-get install -y -qq --no-install-recommends \
   util-linux usbutils \
   dosfstools ntfs-3g exfat-fuse eject
-
-cat > /etc/modules-load.d/usb-storage.conf << 'MOD'
-usb-storage
-uas
-vfat
-nls_cp437
-nls_iso8859-1
-nls_utf8
-fuse
-MOD
 
 cat > /etc/udev/rules.d/99-usb-storage-mount.rules << 'UDEV'
 ACTION=="add", SUBSYSTEM=="block", KERNEL=="sd[a-z][0-9]", ENV{SYSTEMD_WANTS}+="usb-mount@%k.service"
@@ -148,12 +141,23 @@ case "$ACTION" in
     [ -z "$FSTYPE" ] && exit 0
     mkdir -p "$MOUNT_POINT"
     case "$FSTYPE" in
-      vfat|fat|msdos) mount -t vfat -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" || true ;;
-      exfat) mount.exfat-fuse -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" 2>/dev/null \
-               || mount -t exfat -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" 2>/dev/null || true ;;
-      ntfs) mount -t ntfs-3g -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" || true ;;
-      ext4|ext3|ext2) mount -t "$FSTYPE" -o rw "$DEV_PATH" "$MOUNT_POINT" || true ;;
-      *) mount -o rw "$DEV_PATH" "$MOUNT_POINT" 2>/dev/null || true ;;
+      vfat|fat|msdos)
+        mount -t vfat -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" || true
+        ;;
+      exfat)
+        mount.exfat-fuse -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" 2>/dev/null \
+          || mount -t exfat -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" 2>/dev/null \
+          || true
+        ;;
+      ntfs)
+        mount -t ntfs-3g -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" || true
+        ;;
+      ext4|ext3|ext2)
+        mount -t "$FSTYPE" -o rw "$DEV_PATH" "$MOUNT_POINT" || true
+        ;;
+      *)
+        mount -o rw "$DEV_PATH" "$MOUNT_POINT" 2>/dev/null || true
+        ;;
     esac
     ;;
   remove)
@@ -177,50 +181,104 @@ ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
 echo "$TIMEZONE" > /etc/timezone
 dpkg-reconfigure -f noninteractive tzdata >/dev/null 2>&1 || true
 
-# ========== root 密码 ==========
+# ========== root 密码（只用 chpasswd） ==========
 echo "==> 设置 root 密码（长度 ${#ROOT_PASSWORD} 字符）"
 echo "root:$ROOT_PASSWORD" | chpasswd
 sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
 
+# ============================================================
+# 【关键修复】firstboot-password（正向判据防弹版）
+#
+# 历史 bug 分析：
+#   p7 recovery 用 cp -a 覆盖 p9 时【不删除旧文件】，
+#   p9 上残留的 /var/lib/firstboot-password.done 会导致旧版
+#   ConditionPathExists=!/var/lib/firstboot-password.done 永不满足，
+#   firstboot-password 永远不执行 → 密码保持 p7 chpasswd 写入的值。
+#
+# 新版设计：
+#   1. 判据改用 /etc/firstboot-pwd.txt 存在（正向），不依赖 .done
+#   2. firstboot-pwd.txt 由构建时写入，p7 cp -a 一定覆盖（在 1024MB 内）
+#   3. 提前到 getty.target / serial-getty@ttyAMA0 之前执行
+#   4. 脚本内自动修复 shadow 权限、shadow 组、root 用户
+# ============================================================
 printf '%s\n' "$ROOT_PASSWORD" > /etc/firstboot-pwd.txt
 chmod 600 /etc/firstboot-pwd.txt
 chown root:root /etc/firstboot-pwd.txt
 
 cat > /usr/local/sbin/firstboot-password.sh << 'SH'
 #!/bin/bash
-[ -f /etc/firstboot-pwd.txt ] || exit 0
-PWD=$(cat /etc/firstboot-pwd.txt)
-echo "root:$PWD" | chpasswd
+set -e
+PWDFILE=/etc/firstboot-pwd.txt
+[ -f "$PWDFILE" ] || exit 0
+
+# 用 cat 原样读取密码，避免 echo 展开特殊字符
+{ printf 'root:'; cat "$PWDFILE"; } | chpasswd
+
+# 确保 shadow 组存在（p7 覆盖可能破坏 /etc/group）
+getent group shadow > /dev/null 2>&1 || groupadd -r shadow
+
+# 确保 root 用户在 /etc/passwd（p7 覆盖可能破坏 /etc/passwd）
+if ! grep -q '^root:' /etc/passwd; then
+    sed -i '1i root:x:0:0:root:/root:/bin/bash' /etc/passwd
+fi
+
+# 修复关键文件权限（p7 覆盖可能破坏权限）
+chmod 644 /etc/passwd /etc/group
+chmod 640 /etc/shadow /etc/gshadow
+chown root:root /etc/passwd /etc/group
+chown root:shadow /etc/shadow /etc/gshadow
+
+# 更新 shadow 时间戳
 chage -d "$(date +%Y-%m-%d)" root 2>/dev/null || true
-rm -f /etc/firstboot-pwd.txt
-touch /var/lib/firstboot-password.done
+
+# 删除密码文件，防重复执行
+rm -f "$PWDFILE"
+
+echo "firstboot-password: reset done at $(date)" \
+    | systemd-cat -t firstboot-password 2>/dev/null || true
 SH
 chmod +x /usr/local/sbin/firstboot-password.sh
 
 cat > /etc/systemd/system/firstboot-password.service << 'SVC'
 [Unit]
 Description=First boot: force reset root password
-ConditionPathExists=!/var/lib/firstboot-password.done
-Before=ssh.service
+ConditionPathExists=/etc/firstboot-pwd.txt
+Before=ssh.service getty.target serial-getty@ttyAMA0.service
+DefaultDependencies=no
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/sbin/firstboot-password.sh
+TimeoutStartSec=30
+
+[Install]
+WantedBy=sysinit.target
+SVC
+systemctl enable firstboot-password.service 2>/dev/null || true
+echo "✅ firstboot-password.service 已启用（正向 ConditionPathExists）"
+
+# ========== firstboot-apt-update.service ==========
+cat > /etc/systemd/system/firstboot-apt-update.service << 'SVC'
+[Unit]
+Description=First boot: refresh apt package lists in background
+ConditionPathExists=!/var/lib/firstboot-apt-update.done
+After=network-online.target networking.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c 'for i in $(seq 1 90); do if ping -c 1 -W 1 223.5.5.5 >/dev/null 2>&1; then break; fi; sleep 1; done; /usr/bin/apt-get update -qq && /bin/touch /var/lib/firstboot-apt-update.done'
+TimeoutStartSec=600
 
 [Install]
 WantedBy=multi-user.target
 SVC
-systemctl enable firstboot-password.service 2>/dev/null || true
-echo "✅ firstboot-password.service 已启用"
+systemctl enable firstboot-apt-update.service 2>/dev/null || true
+echo "✅ firstboot-apt-update.service 已启用"
 
-# ============================================================
-# 【改动 2】网络配置
-#   - eth0 继续由 ifupdown 管理（DHCP 已验证可用）
-#   - wlan0 由 NetworkManager 管理（供 nmtui-connect 使用）
-#   - NM 显式不接管 eth0，避免与 ifupdown 冲突
-#   - 关闭 WiFi 省电、禁用扫描 MAC 随机化（连接更稳）
-# ============================================================
+# ========== 网络配置 ==========
 echo "==> 网络配置 (eth0: ifupdown / wlan0: NetworkManager)"
 mkdir -p /etc/network/interfaces.d
 if [ -n "${CUSTOM_MAC:-}" ]; then
@@ -242,15 +300,12 @@ fi
 
 mkdir -p /etc/NetworkManager/conf.d
 cat > /etc/NetworkManager/conf.d/99-hinas.conf << 'NMCONF'
-# eth0 交给 ifupdown，NM 不碰
 [keyfile]
 unmanaged-devices=interface-name:eth0
 
-# 关闭 WiFi 扫描 MAC 随机化（避免路由器 DHCP 每次分配新 IP）
 [device]
 wifi.scan-rand-mac-address=no
 
-# 2 = 关闭 WiFi 省电，连接更稳定
 [connection]
 wifi.powersave = 2
 NMCONF
@@ -309,20 +364,16 @@ if command -v ssh-keygen >/dev/null 2>&1; then
   done
 fi
 
-# ============================================================
-# 【改动 3】服务优化：启用 NM + rfkill unblock
-# ============================================================
+# ========== 服务优化 ==========
 echo "==> 服务优化"
 systemctl enable ssh networking systemd-timesyncd systemd-resolved 2>/dev/null || true
 systemctl enable NetworkManager NetworkManager-dispatcher 2>/dev/null || true
 systemctl mask motd-news.timer motd-news.service 2>/dev/null || true
 systemctl mask apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
 systemctl mask dpkg-db-backup.timer 2>/dev/null || true
-# 装 NM 可能重新启用 networkd-dispatcher，重新 mask
 systemctl mask networkd-dispatcher 2>/dev/null || true
 systemctl set-default multi-user.target 2>/dev/null || true
 
-# 开机解除 WiFi 软屏蔽（rfkill）
 cat > /etc/systemd/system/rfkill-unblock-wifi.service << 'SVC'
 [Unit]
 Description=Unblock WiFi via rfkill
@@ -344,14 +395,24 @@ NTP=ntp.aliyun.com ntp.tencent.com cn.pool.ntp.org
 FallbackNTP=0.cn.pool.ntp.org 1.cn.pool.ntp.org 2.cn.pool.ntp.org 3.cn.pool.ntp.org
 NTP
 
+# ========== logind + system 老内核兼容 ==========
 SYSTEMD_VER=$(systemctl --version 2>/dev/null | head -1 | awk '{print $2}' | cut -d. -f1)
 if [ "${SYSTEMD_VER:-0}" -ge 247 ] 2>/dev/null; then
+    echo "==> systemd $SYSTEMD_VER >= 247，写入 logind + system 兼容配置"
     mkdir -p /etc/systemd/logind.conf.d
     cat > /etc/systemd/logind.conf.d/99-old-kernel.conf << 'LOGIND'
 [Login]
 ProtectProc=default
 ProcSubset=all
 LOGIND
+
+    mkdir -p /etc/systemd/system.conf.d
+    cat > /etc/systemd/system.conf.d/99-old-kernel.conf << 'SYSCONF'
+[Manager]
+DefaultProtectProc=default
+SYSCONF
+else
+    echo "==> systemd ${SYSTEMD_VER:-未知} < 247，跳过 logind 兼容配置"
 fi
 
 mkdir -p /etc/systemd/resolved.conf.d
@@ -376,11 +437,13 @@ nameserver 223.5.5.5
 nameserver 223.6.6.6
 RESOLV
 
-# ========== 深度清理 ==========
+# ========== 深度清理（保留 apt lists） ==========
 echo "==> 深度清理"
 apt-get autoremove -y --purge
 apt-get clean
-rm -rf /var/lib/apt/lists/* /var/tmp/* /tmp/* /root/.cache 2>/dev/null || true
+
+# 保留 /var/lib/apt/lists/*（配合 99-no-translations 已精简）
+rm -rf /var/tmp/* /tmp/* /root/.cache 2>/dev/null || true
 rm -rf /usr/share/doc /usr/share/man /usr/share/info \
        /usr/share/lintian /usr/share/linda /usr/share/groff 2>/dev/null || true
 rm -rf /usr/lib/systemd/catalog \
@@ -426,51 +489,116 @@ for f in /mv100*.zip /www_raw.ext4 /backup-32.gz /sdat2img.py \
 done
 
 # ============================================================
-# 【改动 4】审计段：确认 WiFi 相关命令存在
+# 审计（关键检查 + 硬性 fail）
 # ============================================================
 echo "========== rootfs 审计 =========="
+
 echo "--- Ubuntu 代号 ---"
 echo "$CODENAME"
+
 echo "--- APT 源 ---"
 if [ "$CODENAME" = "noble" ]; then
     cat /etc/apt/sources.list.d/ubuntu.sources
 else
     cat /etc/apt/sources.list
 fi
+
+echo "--- APT lists（应非空）---"
+du -sh /var/lib/apt/lists/ 2>/dev/null || echo "(MISSING!)"
+
 echo "--- /root ---"
 ls -la /root/
+
 echo "--- /tmp ---"
 ls -la /tmp/ 2>/dev/null || echo "(empty)"
+
 echo "--- /home ---"
 ls -la /home/
+
 echo "--- locale 数据 ---"
 ls /usr/lib/locale/ 2>/dev/null
-echo "--- locale 源数据 ---"
-ls /usr/share/i18n/locales/ 2>/dev/null | head -5
+
 echo "--- WiFi / NM 命令检查 ---"
 for c in file nmtui nmtui-connect nmcli iw rfkill wpa_supplicant; do
   printf '  %-18s ' "$c"
   command -v "$c" 2>/dev/null || echo "(MISSING!)"
 done
-echo "--- NetworkManager 配置 ---"
-ls -la /etc/NetworkManager/conf.d/ 2>/dev/null
-cat /etc/NetworkManager/conf.d/99-hinas.conf 2>/dev/null
-echo "--- NetworkManager 服务 ---"
-systemctl is-enabled NetworkManager 2>/dev/null || true
-systemctl is-enabled rfkill-unblock-wifi.service 2>/dev/null || true
-echo "--- USB 支持文件 ---"
-ls -la /usr/local/sbin/usb-mount.sh \
-       /etc/udev/rules.d/99-usb-storage-mount.rules \
-       /etc/systemd/system/usb-mount@.service 2>/dev/null || echo "(MISSING!)"
-echo "--- firstboot-password 文件 ---"
-ls -la /etc/firstboot-pwd.txt /usr/local/sbin/firstboot-password.sh \
-       /etc/systemd/system/firstboot-password.service 2>/dev/null || echo "(MISSING!)"
-echo "--- /etc/shadow 中 root 行（前 30 字符）---"
-grep '^root:' /etc/shadow | cut -c1-30
+
+# ============================================================
+# 【关键检查】firstboot-password 完整性
+# 任一项不符则 exit 1，防止产出"不能登录"的镜像
+# ============================================================
+echo "--- firstboot-password 检查（关键）---"
+
+echo -n "  /etc/firstboot-pwd.txt: "
+if [ -f /etc/firstboot-pwd.txt ]; then
+    echo "存在 (size=$(stat -c%s /etc/firstboot-pwd.txt) bytes)"
+else
+    echo "❌ 缺失！首次启动不会重置密码"
+    exit 1
+fi
+
+echo -n "  /usr/local/sbin/firstboot-password.sh: "
+if [ -x /usr/local/sbin/firstboot-password.sh ]; then
+    echo "存在且可执行"
+else
+    echo "❌ 缺失或不可执行"
+    exit 1
+fi
+
+echo -n "  systemd enable: "
+if systemctl is-enabled firstboot-password.service 2>/dev/null | grep -q '^enabled'; then
+    echo "enabled"
+else
+    echo "❌ 未 enable"
+    exit 1
+fi
+
+echo -n "  sysinit.target.wants 符号链接: "
+if [ -L /etc/systemd/system/sysinit.target.wants/firstboot-password.service ]; then
+    echo "存在"
+    ls -la /etc/systemd/system/sysinit.target.wants/firstboot-password.service
+else
+    echo "❌ 不存在"
+    exit 1
+fi
+
+echo "  service 的 ConditionPathExists:"
+grep '^ConditionPathExists' /etc/systemd/system/firstboot-password.service
+if grep -q '^ConditionPathExists=!' /etc/systemd/system/firstboot-password.service; then
+    echo "  ❌ 检测到反向判据（!），会导致 p7 残留 .done 拦住服务"
+    exit 1
+fi
+
+echo "  /etc/shadow 中 root 行（前 40 字符）:"
+grep '^root:' /etc/shadow | cut -c1-40
+if ! grep -q '^root:\$' /etc/shadow; then
+    echo "  ❌ shadow 中 root 行结构异常（无 root:\$ 前缀）"
+    exit 1
+fi
+
+echo "  shadow/passwd 权限:"
+stat -c '    %A %U:%G %n' /etc/passwd /etc/shadow /etc/group /etc/gshadow
+SHADOW_PERM=$(stat -c '%a %U:%G' /etc/shadow)
+if [ "$SHADOW_PERM" != "640 root:shadow" ]; then
+    echo "  ❌ shadow 权限异常：$SHADOW_PERM（期望 640 root:shadow）"
+    exit 1
+fi
+
+echo "--- logind / system 兼容配置 ---"
+ls /etc/systemd/logind.conf.d/ /etc/systemd/system.conf.d/ 2>/dev/null
+
+echo "--- modules-load.d（应为空）---"
+ls -la /etc/modules-load.d/ 2>/dev/null
+
 echo "--- SSH 主机密钥 comment ---"
 for k in /etc/ssh/ssh_host_*_key.pub; do
   [ -f "$k" ] && ssh-keygen -lf "$k" 2>/dev/null
 done
+
+echo "--- rootfs 总计（不含 proc/sys/dev/run/tmp）---"
+du -sh --exclude=/proc --exclude=/sys --exclude=/dev --exclude=/run --exclude=/tmp / 2>/dev/null | awk '{print "  " $1 "  总计"}' || true
+
 echo "========== 审计结束 =========="
 
 echo "✅ Chroot 内配置完成"
