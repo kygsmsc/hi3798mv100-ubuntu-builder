@@ -25,7 +25,7 @@ on:
       root_password:
         description: 'root 登录密码（生产环境务必修改）'
         required: false
-        default: 'root12
+        default: 'root12'
       minimal_mode:
         description: '精简模式（yes = 额外移除 htop/bash-completion，省 ~4MB）'
         required: false
