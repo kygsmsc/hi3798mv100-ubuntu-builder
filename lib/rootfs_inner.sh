@@ -3,9 +3,7 @@
 #   MODE MIRROR HOSTNAME ROOT_PASSWORD TIMEZONE LOCALES UBUNTU_CODENAME
 # lib/rootfs_inner.sh — 在 chroot 内执行的系统配置脚本
 # 兼容 Ubuntu 20.04 (focal) / 22.04 (jammy) / 24.04 (noble)
-#!/bin/bash
-# lib/rootfs_inner.sh — 在 chroot 内执行的系统配置脚本
-# 兼容 Ubuntu 20.04 (focal) / 22.04 (jammy) / 24.04 (noble)
+
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 export LC_ALL=C LANG=C
@@ -36,15 +34,6 @@ DPkg::Options:: "--path-exclude=/usr/share/locale/*";
 DPkg::Options:: "--path-include=/usr/share/locale/en/*";
 DPkg::Options:: "--path-include=/usr/share/locale/zh_CN/*";
 LOCCONF
-
-# 跳过 DEP-11 和 Translation，apt lists 只保留 Packages
-cat > /etc/apt/apt.conf.d/99-no-translations << 'APTCONF'
-Acquire::IndexTargets::deb::DEP-11::DefaultEnabled "false";
-Acquire::IndexTargets::deb::DEP-11-icons::DefaultEnabled "false";
-Acquire::IndexTargets::deb::DEP-11-icons-small::DefaultEnabled "false";
-Acquire::IndexTargets::deb::DEP-11-icons-large::DefaultEnabled "false";
-Acquire::Languages "none";
-APTCONF
 
 CODENAME="${UBUNTU_CODENAME:-focal}"
 echo "==> Ubuntu 代号: $CODENAME"
@@ -81,7 +70,7 @@ fi
 apt-get update -qq
 apt-get -f install -y -qq 2>&1 || true
 
-# ========== 核心软件包 ==========
+# ========== 核心软件包（含 WiFi 脚本依赖）==========
 echo "==> 安装核心软件包"
 apt-get install -y -qq --no-install-recommends \
   systemd systemd-sysv systemd-timesyncd dbus udev \
@@ -92,11 +81,21 @@ apt-get install -y -qq --no-install-recommends \
   locales tzdata \
   file network-manager wpasupplicant iw rfkill
 
-# ========== USB 存储支持（不写 modules-load.d） ==========
+# ========== USB 存储支持 ==========
 echo "==> USB 存储支持"
 apt-get install -y -qq --no-install-recommends \
   util-linux usbutils \
   dosfstools ntfs-3g exfat-fuse eject
+
+cat > /etc/modules-load.d/usb-storage.conf << 'MOD'
+usb-storage
+uas
+vfat
+nls_cp437
+nls_iso8859-1
+nls_utf8
+fuse
+MOD
 
 cat > /etc/udev/rules.d/99-usb-storage-mount.rules << 'UDEV'
 ACTION=="add", SUBSYSTEM=="block", KERNEL=="sd[a-z][0-9]", ENV{SYSTEMD_WANTS}+="usb-mount@%k.service"
@@ -141,23 +140,12 @@ case "$ACTION" in
     [ -z "$FSTYPE" ] && exit 0
     mkdir -p "$MOUNT_POINT"
     case "$FSTYPE" in
-      vfat|fat|msdos)
-        mount -t vfat -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" || true
-        ;;
-      exfat)
-        mount.exfat-fuse -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" 2>/dev/null \
-          || mount -t exfat -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" 2>/dev/null \
-          || true
-        ;;
-      ntfs)
-        mount -t ntfs-3g -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" || true
-        ;;
-      ext4|ext3|ext2)
-        mount -t "$FSTYPE" -o rw "$DEV_PATH" "$MOUNT_POINT" || true
-        ;;
-      *)
-        mount -o rw "$DEV_PATH" "$MOUNT_POINT" 2>/dev/null || true
-        ;;
+      vfat|fat|msdos) mount -t vfat -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" || true ;;
+      exfat) mount.exfat-fuse -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" 2>/dev/null \
+               || mount -t exfat -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" 2>/dev/null || true ;;
+      ntfs) mount -t ntfs-3g -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" || true ;;
+      ext4|ext3|ext2) mount -t "$FSTYPE" -o rw "$DEV_PATH" "$MOUNT_POINT" || true ;;
+      *) mount -o rw "$DEV_PATH" "$MOUNT_POINT" 2>/dev/null || true ;;
     esac
     ;;
   remove)
@@ -181,12 +169,11 @@ ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
 echo "$TIMEZONE" > /etc/timezone
 dpkg-reconfigure -f noninteractive tzdata >/dev/null 2>&1 || true
 
-# ========== root 密码（只用 chpasswd） ==========
+# ========== root 密码 ==========
 echo "==> 设置 root 密码（长度 ${#ROOT_PASSWORD} 字符）"
 echo "root:$ROOT_PASSWORD" | chpasswd
 sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
 
-# ========== firstboot-password.service（旧版 .done 判据） ==========
 printf '%s\n' "$ROOT_PASSWORD" > /etc/firstboot-pwd.txt
 chmod 600 /etc/firstboot-pwd.txt
 chown root:root /etc/firstboot-pwd.txt
@@ -219,7 +206,11 @@ SVC
 systemctl enable firstboot-password.service 2>/dev/null || true
 echo "✅ firstboot-password.service 已启用"
 
-# ========== firstboot-apt-update.service ==========
+# ============================================================
+# 【新增】firstboot-apt-update.service
+# 首次启动后台刷新 apt 索引，防止保留的 lists 过期
+# 如果网络超时或 apt update 失败，不 touch done 标记，下次启动再试
+# ============================================================
 cat > /etc/systemd/system/firstboot-apt-update.service << 'SVC'
 [Unit]
 Description=First boot: refresh apt package lists in background
@@ -288,7 +279,7 @@ for _loc in en_US.UTF-8 zh_CN.UTF-8; do
     echo "❌ locale 生成失败: $_dir，尝试 localedef 兜底..."
     mkdir -p "$_dir"
     if ! localedef -i "$(echo "$_loc" | cut -d. -f1)" -f UTF-8 "$_loc" 2>&1; then
-      echo "❌ localedef 也失败，检查 /usr/share/i18n/locales/"
+      echo "❌ localedef 也失败"
       ls -la /usr/share/i18n/locales/ 2>&1 | head -10
       exit 1
     fi
@@ -356,24 +347,14 @@ NTP=ntp.aliyun.com ntp.tencent.com cn.pool.ntp.org
 FallbackNTP=0.cn.pool.ntp.org 1.cn.pool.ntp.org 2.cn.pool.ntp.org 3.cn.pool.ntp.org
 NTP
 
-# ========== logind + system 老内核兼容 ==========
 SYSTEMD_VER=$(systemctl --version 2>/dev/null | head -1 | awk '{print $2}' | cut -d. -f1)
 if [ "${SYSTEMD_VER:-0}" -ge 247 ] 2>/dev/null; then
-    echo "==> systemd $SYSTEMD_VER >= 247，写入 logind + system 兼容配置"
     mkdir -p /etc/systemd/logind.conf.d
     cat > /etc/systemd/logind.conf.d/99-old-kernel.conf << 'LOGIND'
 [Login]
 ProtectProc=default
 ProcSubset=all
 LOGIND
-
-    mkdir -p /etc/systemd/system.conf.d
-    cat > /etc/systemd/system.conf.d/99-old-kernel.conf << 'SYSCONF'
-[Manager]
-DefaultProtectProc=default
-SYSCONF
-else
-    echo "==> systemd ${SYSTEMD_VER:-未知} < 247，跳过 logind 兼容配置"
 fi
 
 mkdir -p /etc/systemd/resolved.conf.d
@@ -398,13 +379,16 @@ nameserver 223.5.5.5
 nameserver 223.6.6.6
 RESOLV
 
-# ========== 深度清理（保留 apt lists） ==========
+# ========== 深度清理 ==========
 echo "==> 深度清理"
 apt-get autoremove -y --purge
 apt-get clean
 
-# 保留 /var/lib/apt/lists/*（配合 99-no-translations 已精简）
+# 【关键改动】保留 /var/lib/apt/lists/*，这样刷完机可以直接 apt install
+# 只清临时文件和缓存
 rm -rf /var/tmp/* /tmp/* /root/.cache 2>/dev/null || true
+
+# 注意：不删 /usr/share/i18n（locale 源）和 /var/lib/apt/lists（apt 索引）
 rm -rf /usr/share/doc /usr/share/man /usr/share/info \
        /usr/share/lintian /usr/share/linda /usr/share/groff 2>/dev/null || true
 rm -rf /usr/lib/systemd/catalog \
@@ -459,8 +443,9 @@ if [ "$CODENAME" = "noble" ]; then
 else
     cat /etc/apt/sources.list
 fi
-echo "--- APT lists（应非空）---"
+echo "--- APT lists（关键：应非空，刷完机可直接 apt install）---"
 du -sh /var/lib/apt/lists/ 2>/dev/null || echo "(MISSING!)"
+ls /var/lib/apt/lists/ 2>/dev/null | head -5
 echo "--- /root ---"
 ls -la /root/
 echo "--- /tmp ---"
@@ -469,34 +454,24 @@ echo "--- /home ---"
 ls -la /home/
 echo "--- locale 数据 ---"
 ls /usr/lib/locale/ 2>/dev/null
+echo "--- locale 源数据 ---"
+ls /usr/share/i18n/locales/ 2>/dev/null | head -5
 echo "--- WiFi / NM 命令检查 ---"
 for c in file nmtui nmtui-connect nmcli iw rfkill wpa_supplicant; do
   printf '  %-18s ' "$c"
   command -v "$c" 2>/dev/null || echo "(MISSING!)"
 done
-echo "--- firstboot-password 文件 ---"
-echo -n "  /etc/firstboot-pwd.txt: "
-if [ -f /etc/firstboot-pwd.txt ]; then
-    echo "存在 (size=$(stat -c%s /etc/firstboot-pwd.txt) bytes)"
-else
-    echo "❌ 不存在"
-fi
-echo -n "  /usr/local/sbin/firstboot-password.sh: "
-[ -x /usr/local/sbin/firstboot-password.sh ] && echo "存在且可执行" || echo "❌"
-echo -n "  systemd enable 状态: "
-systemctl is-enabled firstboot-password.service 2>/dev/null || echo "❌ 未 enable"
-echo "--- logind / system 兼容配置 ---"
-ls /etc/systemd/logind.conf.d/ /etc/systemd/system.conf.d/ 2>/dev/null
-echo "--- modules-load.d（应为空）---"
-ls -la /etc/modules-load.d/ 2>/dev/null
+echo "--- NetworkManager 配置 ---"
+cat /etc/NetworkManager/conf.d/99-hinas.conf 2>/dev/null
+echo "--- 首次启动服务 ---"
+systemctl is-enabled firstboot-password.service 2>/dev/null || true
+systemctl is-enabled firstboot-apt-update.service 2>/dev/null || true
 echo "--- /etc/shadow 中 root 行（前 30 字符）---"
 grep '^root:' /etc/shadow | cut -c1-30
 echo "--- SSH 主机密钥 comment ---"
 for k in /etc/ssh/ssh_host_*_key.pub; do
   [ -f "$k" ] && ssh-keygen -lf "$k" 2>/dev/null
 done
-echo "--- rootfs 总计（不含 proc/sys/dev/run/tmp）---"
-du -sh --exclude=/proc --exclude=/sys --exclude=/dev --exclude=/run --exclude=/tmp / 2>/dev/null | awk '{print "  " $1 "  总计"}' || true
 echo "========== 审计结束 =========="
 
 echo "✅ Chroot 内配置完成"
