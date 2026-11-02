@@ -1,9 +1,8 @@
 #!/bin/bash
 # lib/rootfs_inner.sh — 在 chroot 内执行的系统配置脚本
 # 兼容 Ubuntu 20.04 (focal) / 22.04 (jammy) / 24.04 (noble)
-# 修复U盘挂载后root密码失效问题--修复中文乱码--修复wifi驱动安装出错
 #
-# 本版关键修复（vs 用户上传版）：
+# 本版关键修复：
 #   [P1] firstboot-password 正向判据 /etc/firstboot-pwd.txt
 #   [P2] WantedBy=multi-user.target + After=local-fs.target + Before=ssh.service
 #   [P3] chpasswd 失败保留密码文件重试
@@ -14,6 +13,7 @@
 #   [P8] A 级精简 consolefonts/keymaps/hwdb.bin
 #   [P9] 精简不做 apt 操作
 #   [P10] eth0 由 NetworkManager 管理（ifupdown 只处理 lo）
+#   [P11] 删除 Ubuntu 默认 10-globally-managed-devices.conf（排除 eth0 的元凶）
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 export LC_ALL=C LANG=C
@@ -245,14 +245,20 @@ systemctl enable firstboot-apt-update.service 2>/dev/null || true
 echo "✅ firstboot-apt-update.service 已启用"
 
 # ============================================================
-# 【P10】网络配置：eth0 + wlan0 全由 NetworkManager 管理
+# 【P10/P11】网络配置：eth0 + wlan0 全由 NetworkManager 管理
 #
-# 关键点：
-#   1. ifupdown 只配置 lo（127.0.0.1）
-#      NM 的 ifupdown 插件看到 "auto eth0" 会拒绝管理 eth0
-#   2. NM 配置中移除 unmanaged-devices=interface-name:eth0
-#   3. 预置 eth0.nmconnection：DHCP + 可选自定义 MAC
-#   4. 保留 networking.service 启用（只处理 lo，无害）
+# 关键修复（vs 上一版）：
+#   Ubuntu Server/Base 的 network-manager 包自带
+#   /usr/lib/NetworkManager/conf.d/10-globally-managed-devices.conf
+#   内容 "unmanaged-devices=*,except:type:wifi,except:type:gsm,except:type:cdma"
+#   会主动排除 eth0（ethernet 类型）→ eth0 永远 DOWN，无 IP
+#
+#   本版修复：
+#   1. 删除 /usr/lib 下 Ubuntu 默认配置
+#   2. 在 /etc 下写同名文件覆盖（unmanaged-devices= 为空）
+#   3. NM 配置中移除 unmanaged-devices=interface-name:eth0
+#   4. /etc/network/interfaces 只保留 lo
+#   5. 预置 eth0.nmconnection（DHCP + 可选 MAC）
 # ============================================================
 echo "==> 网络配置（eth0 + wlan0 全部由 NetworkManager 管理）"
 
@@ -270,8 +276,20 @@ iface lo inet loopback
 # 禁止在此文件或 interfaces.d 下配置 eth0，否则 NM 会忽略 eth0
 NETIF
 
-# NM 全局配置（不再排除 eth0）
+# 【P11 关键修复 1】删除 Ubuntu Server 默认的 unmanaged-devices 配置
+rm -f /usr/lib/NetworkManager/conf.d/10-globally-managed-devices.conf
+
+# 【P11 关键修复 2】在 /etc 下写同名文件覆盖（/etc 优先级高于 /usr/lib）
 mkdir -p /etc/NetworkManager/conf.d
+cat > /etc/NetworkManager/conf.d/10-globally-managed-devices.conf << 'NMOVERRIDE'
+# 覆盖 Ubuntu Server/Base 默认的 unmanaged-devices 配置
+# 默认配置为 unmanaged-devices=*,except:type:wifi,except:type:gsm,except:type:cdma
+# 会排除所有 ethernet 设备（eth0），本文件将其清空以允许 NM 管理 eth0
+[keyfile]
+unmanaged-devices=
+NMOVERRIDE
+
+# NM 全局配置
 cat > /etc/NetworkManager/conf.d/99-hinas.conf << 'NMCONF'
 # 关闭 WiFi 扫描 MAC 随机化
 [device]
@@ -557,9 +575,10 @@ for c in file nmtui nmtui-connect nmcli iw rfkill wpa_supplicant; do
 done
 
 # ============================================================
-# 【P10】网络管理检查（eth0 由 NM 管理）
+# 【P11】网络管理检查（eth0 → NM）——任一项不符，CI fail
 # ============================================================
 echo "--- 网络管理检查（eth0 → NM）---"
+
 echo -n "  /etc/network/interfaces.d/eth0: "
 if [ -f /etc/network/interfaces.d/eth0 ]; then
     echo "❌ 存在（ifupdown 会抢占 eth0）"
@@ -567,15 +586,40 @@ if [ -f /etc/network/interfaces.d/eth0 ]; then
 else
     echo "✅ 不存在"
 fi
+
 echo "  /etc/network/interfaces:"
-cat /etc/network/interfaces | sed 's/^/    /'
-echo -n "  NM conf 是否排除 eth0: "
+sed 's/^/    /' /etc/network/interfaces
+
+echo -n "  /usr/lib/NetworkManager/conf.d/10-globally-managed-devices.conf: "
+if [ -f /usr/lib/NetworkManager/conf.d/10-globally-managed-devices.conf ]; then
+    echo "❌ 存在（Ubuntu 默认排除 eth0，本应删除）"
+    exit 1
+else
+    echo "✅ 已删除"
+fi
+
+echo -n "  /etc/NetworkManager/conf.d/10-globally-managed-devices.conf: "
+if [ -f /etc/NetworkManager/conf.d/10-globally-managed-devices.conf ]; then
+    if grep -q '^unmanaged-devices=$' /etc/NetworkManager/conf.d/10-globally-managed-devices.conf; then
+        echo "✅ 存在且正确覆盖（unmanaged-devices= 为空）"
+    else
+        echo "❌ 存在但内容不正确（应 unmanaged-devices= 为空）"
+        cat /etc/NetworkManager/conf.d/10-globally-managed-devices.conf | sed 's/^/    /'
+        exit 1
+    fi
+else
+    echo "❌ 缺失（应在构建期写入）"
+    exit 1
+fi
+
+echo -n "  /etc/NetworkManager/conf.d/99-hinas.conf 是否排除 eth0: "
 if grep -q 'unmanaged-devices=interface-name:eth0' /etc/NetworkManager/conf.d/99-hinas.conf 2>/dev/null; then
     echo "❌ 仍排除 eth0"
     exit 1
 else
     echo "✅ 未排除"
 fi
+
 echo -n "  /etc/NetworkManager/system-connections/eth0.nmconnection: "
 if [ -f /etc/NetworkManager/system-connections/eth0.nmconnection ]; then
     PERM=$(stat -c '%a %U:%G' /etc/NetworkManager/system-connections/eth0.nmconnection)
@@ -592,6 +636,9 @@ fi
 echo "  预置连接内容:"
 sed 's/^/    /' /etc/NetworkManager/system-connections/eth0.nmconnection
 
+# ============================================================
+# firstboot-password 检查
+# ============================================================
 echo "--- firstboot-password 检查（关键）---"
 echo -n "  /etc/firstboot-pwd.txt: "
 if [ -f /etc/firstboot-pwd.txt ]; then
