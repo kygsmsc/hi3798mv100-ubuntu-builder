@@ -13,11 +13,11 @@ on:
       base_version:
         description: 'Ubuntu Base 版本号（如 20.04.5 / 22.04.5 / 24.04.5）'
         required: false
-        default: '20.04.5'
+        default: '22.04.5'
       base_url:
         description: 'Ubuntu Base 下载目录'
         required: false
-        default: 'https://cdimage.ubuntu.com/ubuntu-base/releases/20.04/release'
+        default: 'https://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release'
       mirror:
         description: 'apt 软件源镜像'
         required: false
@@ -29,7 +29,7 @@ on:
       p9_size_mb:
         description: 'p9 rootfs ext4 初始大小（MB）。原厂约 828MB，默认 1024MB 留冗余'
         required: false
-        default: '1024'
+        default: '512'
       custom_mac:
         description: '自定义 eth0 MAC（留空则用设备原生。多设备场景每台设不同值）'
         required: false
