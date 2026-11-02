@@ -35,13 +35,7 @@ on:
         description: '精简 B 级（yes = 额外移除 htop/bash-completion，省 ~4MB）'
         required: false
         default: 'no'
-  push:
-    branches: [ main ]
-    paths:
-      - 'build_rootfs.sh'
-      - 'build_usb_rootfs.sh'
-      - 'lib/**'
-      - '.github/workflows/**'
+  
 
 concurrency:
   group: build-ttl-${{ github.ref }}
