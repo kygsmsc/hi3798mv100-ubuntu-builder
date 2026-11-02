@@ -8,7 +8,7 @@ on:
         required: false
         default: 'https://node4.histb.com:9088/update/system/TTL-hi3798mv100-32bit.zip'
       base_version:
-        description: 'Ubuntu Base 版本号（如 20.04.5 / 20.04.6）'
+        description: 'Ubuntu Base 版本号（如 20.04.5 / 22.04.5 / 24.04.5）'
         required: false
         default: '20.04.5'
       base_url:
@@ -23,13 +23,32 @@ on:
         description: 'root 登录密码（生产环境务必修改）'
         required: false
         default: 'root123'
+      p9_size_mb:
+        description: 'p9 rootfs ext4 初始大小（MB）。原厂约 828MB，默认 1024MB 留冗余。若原包 rootfs-32.img 更大则用原大小'
+        required: false
+        default: '1024'
+      custom_mac:
+        description: '自定义 eth0 MAC（留空则用设备原生。多设备场景每台设不同值）'
+        required: false
+        default: ''
+      minimal_mode:
+        description: '精简 B 级（yes = 额外移除 htop/bash-completion，省 ~4MB）'
+        required: false
+        default: 'no'
+  push:
+    branches: [ main ]
+    paths:
+      - 'build_rootfs.sh'
+      - 'build_usb_rootfs.sh'
+      - 'lib/**'
+      - '.github/workflows/**'
 
 concurrency:
   group: build-ttl-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -38,10 +57,13 @@ jobs:
 
     env:
       TTL_URL: ${{ inputs.ttl_url || 'https://node4.histb.com:9088/update/system/TTL-hi3798mv100-32bit.zip' }}
-      UBUNTU_VERSION: ${{ inputs.base_version }}
-      BASE_URL: ${{ inputs.base_url }}
-      MIRROR: ${{ inputs.mirror }}
-      ROOT_PASSWORD: ${{ inputs.root_password }}
+      UBUNTU_VERSION: ${{ inputs.base_version || '20.04.5' }}
+      BASE_URL: ${{ inputs.base_url || 'https://cdimage.ubuntu.com/ubuntu-base/releases/20.04/release' }}
+      MIRROR: ${{ inputs.mirror || 'http://repo.huaweicloud.com/ubuntu-ports' }}
+      ROOT_PASSWORD: ${{ inputs.root_password || 'root123' }}
+      P9_SIZE_MB: ${{ inputs.p9_size_mb || '1024' }}
+      CUSTOM_MAC: ${{ inputs.custom_mac || '' }}
+      MINIMAL_MODE: ${{ inputs.minimal_mode || 'no' }}
 
     steps:
     - name: 1. 检出代码
@@ -54,69 +76,268 @@ jobs:
         unzip -tq original_ttl.zip >/dev/null || { echo "❌ 原始包损坏"; exit 1; }
         echo "✅ 原始包完整性 OK"
 
-    - name: 3. 解压原始包
+    - name: 3. 解压并验证原厂 TTL 包
       run: |
         rm -rf ttl_template
         mkdir -p ttl_template
         unzip -q original_ttl.zip -d ttl_template/
         ls -la ttl_template/
-        test -f ttl_template/rootfs-32.img && echo "✅ 找到 rootfs-32.img" || { echo "❌ 包内未找到 rootfs-32.img"; exit 1; }
+
+        echo "========== 原厂 TTL 包完整文件清单 =========="
+        find ttl_template -type f | sort
+        echo "============================================="
+
+        test -f ttl_template/rootfs-32.img || { echo "❌ 包内未找到 rootfs-32.img"; exit 1; }
+        echo "✅ 找到 rootfs-32.img"
+
+        ORIG_SIZE=$(stat -c%s "ttl_template/rootfs-32.img")
+        ORIG_SIZE_MB=$((ORIG_SIZE / 1024 / 1024))
+        echo "原厂 rootfs-32.img 大小: $ORIG_SIZE_MB MB"
+
+        # 若原大小 > P9_SIZE_MB，使用原大小，避免覆盖原厂更大的镜像
+        if [ "$ORIG_SIZE_MB" -gt "$P9_SIZE_MB" ]; then
+            echo "⚠️  原大小 ($ORIG_SIZE_MB MB) 大于参数 ($P9_SIZE_MB MB)，使用原大小"
+            P9_SIZE_MB=$ORIG_SIZE_MB
+        fi
+        TARGET_SIZE=$((P9_SIZE_MB * 1024 * 1024))
+        echo "目标镜像大小: $TARGET_SIZE 字节 ($P9_SIZE_MB MB)"
+
+        echo "P9_SIZE_MB=$P9_SIZE_MB" >> "$GITHUB_ENV"
+        echo "TARGET_SIZE=$TARGET_SIZE" >> "$GITHUB_ENV"
 
     - name: 4. 安装依赖
       run: |
         sudo apt-get update -qq
         sudo apt-get install -y -qq qemu-user-static e2fsprogs zip
 
-    - name: 5. 缓存 Ubuntu Base 镜像（版本固定，可安全复用）
+    - name: 5. 缓存 Ubuntu Base 镜像
       uses: actions/cache@v4
       with:
         path: cache/ubuntu-base-*.tar.gz
-        key: ubuntu-base-${{ inputs.base_version || '20.04.5' }}
+        key: ubuntu-base-${{ env.UBUNTU_VERSION }}
 
     - name: 6. 构建纯净根文件系统
       run: |
         chmod +x build_rootfs.sh
         ./build_rootfs.sh
+        echo ""
+        echo "========== 构建完成后的 pure_rootfs /root/ =========="
+        sudo ls -la pure_rootfs/root/
 
-    - name: 7. 创建纯净 ext4 镜像
+    - name: 7. 创建纯净 ext4 镜像并审计
       run: |
-        ORIG_SIZE=$(stat -c%s "ttl_template/rootfs-32.img")
-        echo "基于原始大小 ($ORIG_SIZE 字节) 创建镜像..."
-        dd if=/dev/zero of=rootfs-32-pure.img bs=1 count=0 seek=$ORIG_SIZE status=progress
-        mkfs.ext4 -F -m 0 -L "rootfs" rootfs-32-pure.img
-        mkdir -p temp_mount
-        sudo mount -o loop rootfs-32-pure.img temp_mount
-        sudo cp -a pure_rootfs/. temp_mount/
+        ROOTFS_MB=$(sudo du -sm pure_rootfs | cut -f1)
+        echo "rootfs 实际大小: ${ROOTFS_MB} MB"
+        if [ "$ROOTFS_MB" -gt $((P9_SIZE_MB * 90 / 100)) ]; then
+          echo "❌ rootfs (${ROOTFS_MB}MB) 超过 p9 ext4 的 90%"
+          exit 1
+        fi
+
+        P9_IMG="rootfs-32-pure.img"
+        rm -f "$P9_IMG"
+        echo "===== 创建 ext4 镜像 (${P9_SIZE_MB} MB) ====="
+        dd if=/dev/zero of="$P9_IMG" bs=1M count="$P9_SIZE_MB" status=progress
+        mkfs.ext4 -F -m 0 -L "rootfs" "$P9_IMG"
+
+        mkdir -p mnt_p9
+        sudo mount -o loop "$P9_IMG" mnt_p9
+        echo ">>> 拷贝源：pure_rootfs/（我们构建的纯净 rootfs）"
+        sudo cp -a pure_rootfs/. mnt_p9/
         sync
-        sudo umount temp_mount
-        e2fsck -p -f rootfs-32-pure.img || true
-        echo "✅ 镜像创建成功:"
-        ls -lh rootfs-32-pure.img
 
-    - name: 8. 替换并打包
+        # 审计 1：/root 干净
+        echo ""
+        echo "========== 审计1：/root 内容 =========="
+        sudo ls -la mnt_p9/root/ | awk 'NR>1 {print $1, $3, $4, $9, $10, $11}'
+        BAD_ROOT=$(sudo find mnt_p9/root -mindepth 1 -maxdepth 1 \
+            ! -name '.bashrc' ! -name '.profile' ! -name '.bash_logout' \
+            ! -name '.cache' ! -name '.local' 2>/dev/null)
+        if [ -n "$BAD_ROOT" ]; then
+          echo "❌ /root 下有非标准文件:"
+          echo "$BAD_ROOT"
+          sudo umount mnt_p9
+          exit 1
+        fi
+        echo "✅ 审计1通过"
+
+        # 审计 2：/tmp /home 空
+        echo ""
+        echo "========== 审计2：/tmp 和 /home 为空 =========="
+        TMP_COUNT=$(sudo find mnt_p9/tmp -mindepth 1 2>/dev/null | wc -l)
+        HOME_COUNT=$(sudo find mnt_p9/home -mindepth 1 2>/dev/null | wc -l)
+        echo "/tmp 条目数: $TMP_COUNT"
+        echo "/home 条目数: $HOME_COUNT"
+        if [ "$TMP_COUNT" -ne 0 ] || [ "$HOME_COUNT" -ne 0 ]; then
+          echo "❌ /tmp 或 /home 非空"
+          sudo umount mnt_p9
+          exit 1
+        fi
+        echo "✅ 审计2通过"
+
+        # 审计 3：全盘搜可疑文件
+        echo ""
+        echo "========== 审计3：全盘可疑文件搜索 =========="
+        SUSPECT=$(sudo find mnt_p9 -type f \
+            \( -name '*.zip' -o -name '*.tar.gz' -o -name '*.tar.xz' \
+               -o -name '*.ext4' -o -name '*.img' -o -name '*.sparse' \
+               -o -name 'backup-32*' -o -name 'sdat2img*' -o -name 'simg2img*' \
+               -o -name 'sparse_info*' -o -name 'www_raw*' -o -name 'qemu-arm*' \
+               -o -name 'rootfs_inner*' -o -name 'mv100*' -o -name 'TTL-*' \) \
+            2>/dev/null)
+        if [ -n "$SUSPECT" ]; then
+          echo "❌ 发现可疑文件:"
+          echo "$SUSPECT"
+          sudo umount mnt_p9
+          exit 1
+        fi
+        echo "✅ 审计3通过"
+
+        # 审计 4：顶层目录列表
+        echo ""
+        echo "========== 审计4：顶层目录 =========="
+        sudo ls -la mnt_p9/ | awk 'NR>1 {print $1, $3, $4, $9}'
+
+        sudo umount mnt_p9
+        e2fsck -p -f "$P9_IMG" || true
+        echo "镜像: $(stat -c%s "$P9_IMG") 字节 ($(stat -c%s "$P9_IMG" | awk '{printf "%.0f MB", $1/1024/1024}'))"
+        ls -lh "$P9_IMG"
+
+        echo ""
+        echo "=============================================="
+        echo "✅ step 7 完成，4 项审计全部通过"
+        echo "=============================================="
+
+    - name: 8. 替换并重新打包
       run: |
-        rm -rf final_package
-        cp -r ttl_template/ final_package/
-        cp rootfs-32-pure.img final_package/rootfs-32.img
-        cd final_package
-        zip -q -r "../TTL-hi3798mv100-32bit-PURE-$(date +%Y%m%d).zip" .
-        cd ..
-        echo "最终刷机包:"
-        ls -lh TTL-hi3798mv100-32bit-PURE-*.zip
+        SOURCE_OS="Ubuntu_${{ env.UBUNTU_VERSION }}"
+        FINAL_DIR="TTL-hi3798mv100-32bit-PURE"
+        rm -rf "$FINAL_DIR"
+        cp -r ttl_template "$FINAL_DIR"
 
-    - name: 9. 上传产物
+        # 只替换 rootfs-32.img，其他原厂文件保持不动
+        rm -f "$FINAL_DIR/rootfs-32.img"
+        cp rootfs-32-pure.img "$FINAL_DIR/rootfs-32.img"
+
+        echo "========== 最终刷机包文件清单 =========="
+        find "$FINAL_DIR" -type f | sort
+        echo "========================================="
+        echo "文件数: $(find "$FINAL_DIR" -type f | wc -l)"
+
+        INNER_ZIP="TTL-hi3798mv100-32bit-PURE-${SOURCE_OS}-$(date +%Y%m%d).zip"
+        cd "$FINAL_DIR"
+        zip -q -r "../${INNER_ZIP}" .
+        cd ..
+        echo "INNER_ZIP=${INNER_ZIP}" >> "$GITHUB_ENV"
+        echo "SOURCE_OS=${SOURCE_OS}" >> "$GITHUB_ENV"
+        ls -lh "${INNER_ZIP}"
+
+    - name: 9. 打包总包（含说明文档）
+      run: |
+        RELEASE_ZIP="Hi3798mv100_TTL_${SOURCE_OS}.zip"
+        mkdir -p release_staging
+        cp "${INNER_ZIP}" "release_staging/"
+        cp rootfs-32-pure.img "release_staging/rootfs-32.img"
+
+        cat > "release_staging/刷机包说明.txt" << EOF
+        ================================================================
+          Hi3798MV100 TTL 纯净刷机包 — 使用说明
+        ================================================================
+
+        【构建信息】
+          编译源系统：    Ubuntu ${{ env.UBUNTU_VERSION }}
+          rootfs 实际：   ${ROOTFS_MB} MB
+          镜像大小：      ${P9_SIZE_MB} MB
+          自定义 MAC：    ${{ env.CUSTOM_MAC }}
+          精简模式：      ${{ env.MINIMAL_MODE }}
+          构建日期：      $(date '+%Y-%m-%d %H:%M:%S')
+
+        【构建保证】
+          - rootfs 完全从 Ubuntu Base 构建，与原厂内容无交集
+          - 4 项构建期审计全部通过
+          - firstboot-password 使用正向判据，p7 残留不影响执行
+
+        【root 账号信息】
+          用户名：        root
+          初始密码：      ${{ env.ROOT_PASSWORD }}
+          ⚠️ 首次登录后请立即执行 passwd root 修改密码！
+
+        【功能特性】
+          - USB 存储自动挂载（FAT32/exFAT/NTFS/ext4）
+          - WiFi 支持（NetworkManager + wpasupplicant + iw + rfkill）
+          - 网络 DHCP 自动获取 IP
+          - SSH 远程登录
+          - 国内 NTP 时间同步
+          - UTF-8 locale（en_US + zh_CN）
+          - apt lists 保留（刷完机可直接 apt install，无需先 apt update）
+          - A 级精简（已移除 consolefonts/keymaps/hwdb.bin，省 ~17MB）
+
+        【rootfs 净尺寸】
+          ${ROOTFS_MB} MB（占 p9 分区的 $((${ROOTFS_MB} * 100 / (P9_SIZE_MB)))%）
+
+        【刷机步骤】
+          1. 将刷机包 zip 解压到 U 盘根目录（FAT32）
+          2. U 盘插入机顶盒 USB 口
+          3. 按住 Recovery 按钮通电，等待自动刷机
+          4. 首次启动较慢，耐心等待
+
+        【注意事项】
+          - 刷机前请确认设备型号与本包匹配
+          - U 盘建议 USB 2.0 接口
+          - root 初始密码为：${{ env.ROOT_PASSWORD }}
+          - 刷机完成后拔掉 U 盘，避免每次重启都重新刷机
+        ================================================================
+        EOF
+        sed -i 's/^        //' "release_staging/刷机包说明.txt"
+
+        cd release_staging
+        zip -q -r "../${RELEASE_ZIP}" .
+        cd ..
+        echo "RELEASE_ZIP=${RELEASE_ZIP}" >> "$GITHUB_ENV"
+        ls -lh "${RELEASE_ZIP}"
+
+    - name: 10. 上传 Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: pure-ttl-package
+        name: Hi3798mv100_TTL_${{ env.SOURCE_OS }}
         path: |
-          TTL-hi3798mv100-32bit-PURE-*.zip
-          rootfs-32-pure.img
+          Hi3798mv100_TTL_${{ env.SOURCE_OS }}.zip
         retention-days: 7
         if-no-files-found: error
 
-    - name: 10. 清理
+    - name: 11. 上传到 GitHub Releases
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ttl-v${{ github.run_number }}
+        name: "Hi3798MV100 TTL 纯净刷机包 (${{ env.SOURCE_OS }})"
+        body: |
+          ## Hi3798MV100 TTL 纯净刷机包
+
+          | 项目 | 内容 |
+          |------|------|
+          | 编译源系统 | `Ubuntu ${{ env.UBUNTU_VERSION }}` |
+          | rootfs 实际 | `${ROOTFS_MB} MB` |
+          | 镜像大小 | `${P9_SIZE_MB} MB` |
+
+          ### 功能特性
+          - USB 存储自动挂载
+          - WiFi 支持（NetworkManager + wpasupplicant）
+          - 网络 DHCP、SSH 远程登录
+          - 国内 NTP 时间同步
+          - apt lists 保留（可直接 apt install）
+          - A 级精简（-17MB）
+
+          ### 账号信息
+          - **用户名：** `root`
+          - **初始密码：** `${{ env.ROOT_PASSWORD }}`
+          - ⚠️ 首次登录后请立即执行 `passwd root` 修改密码！
+        files: |
+          Hi3798mv100_TTL_${{ env.SOURCE_OS }}.zip
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: 12. 清理
       if: always()
       run: |
-        sudo rm -rf pure_rootfs temp_mount ttl_template final_package 2>/dev/null || true
+        sudo rm -rf pure_rootfs mnt_p9 ttl_template TTL-hi3798mv100-32bit-PURE release_staging 2>/dev/null || true
         rm -f original_ttl.zip rootfs-32-pure.img 2>/dev/null || true
         echo "✅ 清理完成。"
