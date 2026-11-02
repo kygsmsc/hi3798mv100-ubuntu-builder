@@ -14,20 +14,18 @@
 #   LOCALES         生成的 locale（空格分隔）     （默认 en_US.UTF-8 zh_CN.UTF-8）
 #   ROOTFS_DIR      输出目录                      （默认 ./pure_rootfs 或 ./usb_pure_rootfs）
 # ============================================================
-# ============================================================
-# lib/common.sh — hi3798mv100 纯净 Ubuntu rootfs 构建核心
-# ============================================================
+
 set -euo pipefail
 
 MODE="${MODE:?请通过 build_rootfs.sh (ttl) 或 build_usb_rootfs.sh (usb) 调用}"
 UBUNTU_VERSION="${UBUNTU_VERSION:-20.04.5}"
-# 根据 UBUNTU_VERSION 自动推导 BASE_URL 默认值（覆盖 20.04 / 22.04 / 24.04）
 _UBUNTU_SERIES=$(echo "$UBUNTU_VERSION" | cut -d. -f1,2)
 BASE_URL="${BASE_URL:-https://cdimage.ubuntu.com/ubuntu-base/releases/${_UBUNTU_SERIES}/release}"
 MIRROR="${MIRROR:-http://repo.huaweicloud.com/ubuntu-ports}"
 
 TARGET_HOSTNAME="${TARGET_HOSTNAME:-hi3798mv100}"
 CUSTOM_MAC="${CUSTOM_MAC:-}"
+MINIMAL_MODE="${MINIMAL_MODE:-no}"
 ROOT_PASSWORD="${ROOT_PASSWORD:-root123}"
 TIMEZONE="${TIMEZONE:-Asia/Shanghai}"
 LOCALES="${LOCALES:-en_US.UTF-8 zh_CN.UTF-8}"
@@ -43,6 +41,7 @@ export UBUNTU_CODENAME
 echo "==> [common.sh] UBUNTU_VERSION=$UBUNTU_VERSION  =>  CODENAME=$UBUNTU_CODENAME"
 echo "==> [common.sh] TARGET_HOSTNAME=$TARGET_HOSTNAME"
 echo "==> [common.sh] CUSTOM_MAC=${CUSTOM_MAC:-(未设置，用设备原生 MAC)}"
+echo "==> [common.sh] MINIMAL_MODE=$MINIMAL_MODE"
 echo "==> [common.sh] BASE_URL=$BASE_URL"
 echo "==> [common.sh] MIRROR=$MIRROR"
 
@@ -136,6 +135,7 @@ run_inner() {
     MODE="$MODE" MIRROR="$MIRROR" HOSTNAME="$TARGET_HOSTNAME" \
     ROOT_PASSWORD="$ROOT_PASSWORD" TIMEZONE="$TIMEZONE" LOCALES="$LOCALES" \
     UBUNTU_CODENAME="$UBUNTU_CODENAME" CUSTOM_MAC="$CUSTOM_MAC" \
+    MINIMAL_MODE="$MINIMAL_MODE" \
     /bin/bash /tmp/rootfs_inner.sh
 }
 
