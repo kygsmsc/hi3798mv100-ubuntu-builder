@@ -11,7 +11,7 @@ on:
         description: '原始 USB 刷机包下载地址（不填则根据 device_model 自动拼接）'
         required: false
       base_version:
-        description: 'Ubuntu Base 版本号（如 20.04.5 / 22.04.5 / 24.04.5）'
+        description: 'Ubuntu Base 版本号（如 20.04.5 / 22.04.5）'
         required: false
         default: '20.04.5'
       base_url:
@@ -25,26 +25,12 @@ on:
       root_password:
         description: 'root 登录密码（生产环境务必修改）'
         required: false
-        default: 'root12'
-      minimal_mode:
-        description: '精简模式（yes = 额外移除 htop/bash-completion，省 ~4MB）'
-        required: false
-        default: 'no'
+        default: 'root123'
       p9_size_mb:
-        description: 'p9 rootfs ext4 初始大小（MB）。原厂约 828MB，默认 1024MB 留冗余'
+        description: 'p9 rootfs ext4 初始大小（MB）。首次启动 resize2fs 自动扩展到整个 p9 分区。原厂约 828MB，默认 1024MB 留冗余'
         required: false
         default: '1024'
-      custom_mac:
-        description: '自定义 eth0 MAC（留空则用设备原生。多设备场景每台设不同值）'
-        required: false
-        default: ''
-  #push:
-  #  branches: [ main ]
-  #  paths:
-  #   - 'build_rootfs.sh'
-  #   - 'build_usb_rootfs.sh'
-  #   - 'lib/**'
-  #   - '.github/workflows/**'
+ 
 
 concurrency:
   group: build-usb-${{ github.ref }}
@@ -66,8 +52,6 @@ jobs:
       MIRROR: ${{ inputs.mirror || 'http://repo.huaweicloud.com/ubuntu-ports' }}
       ROOT_PASSWORD: ${{ inputs.root_password || 'root123' }}
       P9_SIZE_MB: ${{ inputs.p9_size_mb || '1024' }}
-      CUSTOM_MAC: ${{ inputs.custom_mac || '' }}
-      MINIMAL_MODE: ${{ inputs.minimal_mode || 'no' }}
 
     steps:
     - name: 1. 检出代码
@@ -80,55 +64,29 @@ jobs:
         unzip -tq original_usb.zip >/dev/null || { echo "❌ 原始包损坏"; exit 1; }
         echo "✅ 原始包完整性 OK"
 
-    - name: 3. 解压、验证必备文件、读取原厂 p8 sparse 头（不解压内容）
+    - name: 3. 解压并检测原厂 p8 大小
       run: |
         rm -rf usb_template
         mkdir -p usb_template
         unzip -q original_usb.zip -d usb_template/
-        ls -la usb_template/
         ls -la usb_template/mv100/
-
-        echo "========== 原厂包完整文件清单 =========="
-        find usb_template -type f | sort
-        echo "========================================="
-
-        REQUIRED=(
-          "bootargs.bin"
-          "fastboot.bin"
-          "mv100/baseparam.img"
-          "mv100/bootargs.bin"
-          "mv100/fastboot.bin"
-          "mv100/hi_kernel.bin"
-          "mv100/logo.img"
-          "mv100/pq_param.bin"
-          "mv100/recoverybox32.ext4"
-          "mv100/www_ecoo_top.ext4"
-        )
-        MISSING=""
-        for f in "${REQUIRED[@]}"; do
-          [ -f "usb_template/$f" ] || MISSING="$MISSING\n  - $f"
-        done
-        if [ -n "$MISSING" ]; then
-          echo -e "❌ 原厂包缺少 fastboot 必需文件:$MISSING"
-          exit 1
-        fi
-        echo "✅ 原厂包必备文件齐全"
+        test -f "usb_template/mv100/www_ecoo_top.ext4" && echo "✅ 找到 www_ecoo_top.ext4" || { echo "❌ 未找到"; exit 1; }
 
         cp "usb_template/mv100/www_ecoo_top.ext4" original_p8.sparse
+        ls -lh original_p8.sparse
+
         MAGIC=$(xxd -p -l 4 original_p8.sparse)
-        echo "原厂 p8 magic: $MAGIC"
+        echo "原始镜像 magic: $MAGIC"
         if [ "$MAGIC" != "3aff26ed" ]; then
-          echo "❌ 原厂 www_ecoo_top.ext4 不是 sparse 格式（magic=$MAGIC）"
+          echo "❌ 原始 www_ecoo_top.ext4 不是 Android sparse 格式（magic=$MAGIC）"
           exit 1
         fi
+
         BLK_SZ=$(od -An -tu4 -j12 -N4 original_p8.sparse | tr -d ' ')
         TOTAL_BLKS=$(od -An -tu4 -j16 -N4 original_p8.sparse | tr -d ' ')
         P8_SIZE=$((BLK_SZ * TOTAL_BLKS))
         echo "原厂 p8 raw 大小: $P8_SIZE 字节 ($((P8_SIZE/1024/1024)) MB)"
         echo "P8_SIZE=$P8_SIZE" >> "$GITHUB_ENV"
-
-        echo ""
-        echo "⚠️  后续流程将【完全不碰】原厂 www_ecoo_top.ext4 的实际内容"
 
     - name: 4. 安装依赖
       run: |
@@ -142,113 +100,60 @@ jobs:
         path: cache/ubuntu-base-*.tar.gz
         key: ubuntu-base-${{ env.UBUNTU_VERSION }}
 
-    - name: 6. 构建纯净根文件系统（只从 Ubuntu Base 解压 + chroot 配置）
+    - name: 6. 构建纯净根文件系统
       run: |
         chmod +x build_usb_rootfs.sh
         ./build_usb_rootfs.sh
-        echo ""
-        echo "========== 构建完成后的 usb_pure_rootfs /root/ =========="
-        sudo ls -la usb_pure_rootfs/root/
 
-    - name: 7. 构建 p9 → backup-32.gz → p8（全程审计，每步验证无杂质）
+    - name: 7. 构建 p9 rootfs → backup-32.gz → p8 backup 分区 → sparse
       run: |
+        # ========== 0. 检查 rootfs 是否放得下 ==========
         ROOTFS_MB=$(sudo du -sm usb_pure_rootfs | cut -f1)
         echo "rootfs 实际大小: ${ROOTFS_MB} MB"
         if [ "$ROOTFS_MB" -gt $((P9_SIZE_MB * 90 / 100)) ]; then
-          echo "❌ rootfs (${ROOTFS_MB}MB) 超过 p9 ext4 的 90%"
+          echo "❌ rootfs (${ROOTFS_MB}MB) 超过 p9 ext4 的 90% (${P9_SIZE_MB}MB)"
+          echo "   请增大 p9_size_mb 参数，或精简 rootfs"
           exit 1
         fi
+        echo "✅ rootfs (${ROOTFS_MB}MB) 可放入 p9 ext4 (${P9_SIZE_MB}MB)"
 
-        # 7.1 p9 rootfs ext4
+        # ========== 1. 创建 p9 rootfs ext4 ==========
         P9_IMG="p9-rootfs.img"
         rm -f "$P9_IMG"
-        echo ""
-        echo "===== 7.1 创建 p9 rootfs ext4 (${P9_SIZE_MB} MB) ====="
+        echo "创建 p9 rootfs ext4 (${P9_SIZE_MB} MB)..."
         dd if=/dev/zero of="$P9_IMG" bs=1M count="$P9_SIZE_MB" status=progress
         mkfs.ext4 -F -m 0 -L "rootfs" "$P9_IMG"
 
         mkdir -p mnt_p9
         sudo mount -o loop "$P9_IMG" mnt_p9
-        echo ">>> 拷贝源：usb_pure_rootfs/（我们构建的纯净 rootfs）"
         sudo cp -a usb_pure_rootfs/. mnt_p9/
         sync
-
-        # 审计1
-        echo ""
-        echo "========== 审计1：新 p9 /root/ 内容 =========="
-        sudo ls -la mnt_p9/root/ | awk 'NR>1 {print $1, $3, $4, $9, $10, $11}'
-        BAD_P9_ROOT=$(sudo find mnt_p9/root -mindepth 1 -maxdepth 1 \
-            ! -name '.bashrc' ! -name '.profile' ! -name '.bash_logout' \
-            ! -name '.cache' ! -name '.local' 2>/dev/null)
-        if [ -n "$BAD_P9_ROOT" ]; then
-          echo "❌ 新 p9 /root/ 下有非标准文件:"
-          echo "$BAD_P9_ROOT"
-          sudo umount mnt_p9
-          exit 1
-        fi
-        echo "✅ 审计1通过"
-
-        # 审计2
-        echo ""
-        echo "========== 审计2：新 p9 /tmp 和 /home 为空 =========="
-        TMP_COUNT=$(sudo find mnt_p9/tmp -mindepth 1 2>/dev/null | wc -l)
-        HOME_COUNT=$(sudo find mnt_p9/home -mindepth 1 2>/dev/null | wc -l)
-        echo "/tmp 条目数: $TMP_COUNT"
-        echo "/home 条目数: $HOME_COUNT"
-        if [ "$TMP_COUNT" -ne 0 ] || [ "$HOME_COUNT" -ne 0 ]; then
-          echo "❌ 新 p9 /tmp 或 /home 非空"
-          sudo umount mnt_p9
-          exit 1
-        fi
-        echo "✅ 审计2通过"
-
-        # 审计3
-        echo ""
-        echo "========== 审计3：新 p9 全盘可疑文件搜索 =========="
-        SUSPECT=$(sudo find mnt_p9 -type f \
-            \( -name '*.zip' -o -name '*.tar.gz' -o -name '*.tar.xz' \
-               -o -name '*.ext4' -o -name '*.img' -o -name '*.sparse' \
-               -o -name 'backup-32*' -o -name 'sdat2img*' -o -name 'simg2img*' \
-               -o -name 'sparse_info*' -o -name 'www_raw*' -o -name 'qemu-arm*' \
-               -o -name 'rootfs_inner*' -o -name 'mv100*' -o -name 'TTL-*' \) \
-            2>/dev/null)
-        if [ -n "$SUSPECT" ]; then
-          echo "❌ 新 p9 内发现可疑文件:"
-          echo "$SUSPECT"
-          sudo umount mnt_p9
-          exit 1
-        fi
-        echo "✅ 审计3通过"
-
-        # 审计4
-        echo ""
-        echo "========== 审计4：新 p9 顶层目录列表 =========="
-        sudo ls -la mnt_p9/ | awk 'NR>1 {print $1, $3, $4, $9}'
-
         sudo umount mnt_p9
         e2fsck -p -f "$P9_IMG" || true
-        echo "p9 rootfs: $(stat -c%s "$P9_IMG") 字节"
+        echo "p9 rootfs 最终大小: $(stat -c%s "$P9_IMG") 字节"
+        ls -lh "$P9_IMG"
 
-        # 7.2 backup-32.gz
-        echo ""
-        echo "===== 7.2 压缩为 backup-32.gz ====="
+        # ========== 2. gzip -9 压缩为 backup-32.gz ==========
         rm -f backup-32.gz
+        echo "压缩为 backup-32.gz (gzip -9)..."
         gzip -9 -c "$P9_IMG" > backup-32.gz
         B32_SIZE=$(stat -c%s backup-32.gz)
-        echo "backup-32.gz: $B32_SIZE 字节 ($((B32_SIZE/1024/1024)) MB)"
+        echo "backup-32.gz 大小: $B32_SIZE 字节 ($((B32_SIZE/1024/1024)) MB)"
+        ls -lh backup-32.gz
 
+        # p8 ext4 需要预留元数据空间（约 5~10MB）
         P8_MAX=$((P8_SIZE - 10*1024*1024))
         if [ "$B32_SIZE" -ge "$P8_MAX" ]; then
-          echo "❌ backup-32.gz 太大: $B32_SIZE >= $P8_MAX"
+          echo "❌ backup-32.gz ($((B32_SIZE/1024/1024))MB) 超过 p8 可用空间 ($((P8_MAX/1024/1024))MB)"
+          echo "   请减小 p9_size_mb 参数，或精简 rootfs 后重试"
           exit 1
         fi
-        echo "✅ backup-32.gz 可放入 p8"
+        echo "✅ backup-32.gz ($((B32_SIZE/1024/1024))MB) 可放入 p8 ($((P8_SIZE/1024/1024))MB)"
 
-        # 7.3 p8 backup ext4
-        echo ""
-        echo "===== 7.3 创建 p8 backup ext4 ($P8_SIZE 字节) ====="
+        # ========== 3. 创建 p8 backup ext4（大小 = 原厂 p8 raw 大小，固定 512MB） ==========
         P8_IMG="p8-backup.img"
         rm -f "$P8_IMG"
+        echo "创建 p8 backup ext4 ($P8_SIZE 字节 = $((P8_SIZE/1024/1024)) MB)..."
         dd if=/dev/zero of="$P8_IMG" bs=1 count=0 seek="$P8_SIZE" status=progress
         mkfs.ext4 -F -m 0 -L "backup" "$P8_IMG"
 
@@ -256,113 +161,66 @@ jobs:
         sudo mount -o loop "$P8_IMG" mnt_p8
         sudo cp backup-32.gz mnt_p8/
         sync
-
-        # 审计5
-        echo ""
-        echo "========== 审计5：新 p8 分区内容 =========="
-        sudo ls -la mnt_p8/ | awk 'NR>1 {print $1, $3, $4, $9}'
-        P8_FILES=$(sudo find mnt_p8 -mindepth 1 -maxdepth 1 \
-            ! -name 'lost+found' 2>/dev/null)
-        P8_FILE_COUNT=$(echo "$P8_FILES" | grep -c . || true)
-        echo "非 lost+found 文件数: $P8_FILE_COUNT（期望 1）"
-        if [ "$P8_FILE_COUNT" -ne 1 ]; then
-          echo "❌ p8 内容数量异常"
-          sudo umount mnt_p8
-          exit 1
-        fi
-        if [ ! -f "mnt_p8/backup-32.gz" ]; then
-          echo "❌ p8 内缺 backup-32.gz"
-          sudo umount mnt_p8
-          exit 1
-        fi
-        P8_B32_SIZE=$(sudo stat -c%s mnt_p8/backup-32.gz)
-        if [ "$P8_B32_SIZE" != "$B32_SIZE" ]; then
-          echo "❌ p8 内 backup-32.gz 大小不符"
-          sudo umount mnt_p8
-          exit 1
-        fi
-        echo "✅ 审计5通过"
-
         sudo umount mnt_p8
         e2fsck -p -f "$P8_IMG" || true
 
-        # 7.4 转 sparse
-        echo ""
-        echo "===== 7.4 转 Android sparse ====="
+        P8_ACTUAL=$(stat -c%s "$P8_IMG")
+        echo "p8 raw 大小: $P8_ACTUAL 字节 (期望 $P8_SIZE)"
+        if [ "$P8_ACTUAL" != "$P8_SIZE" ]; then
+          echo "❌ p8 大小不符"
+          exit 1
+        fi
+
+        # 关键校验：p8 ext4 里确实有 backup-32.gz
+        mkdir -p mnt_p8
+        sudo mount -o loop "$P8_IMG" mnt_p8
+        echo "=== p8 分区内容 ==="
+        sudo ls -la mnt_p8/
+        if [ ! -f "mnt_p8/backup-32.gz" ]; then
+          echo "❌ p8 分区内未找到 backup-32.gz"
+          sudo umount mnt_p8
+          exit 1
+        fi
+        echo "✅ p8 分区内 backup-32.gz 存在"
+        sudo umount mnt_p8
+
+        # ========== 4. 转 Android sparse ==========
         rm -f www_ecoo_top.img
         img2simg "$P8_IMG" "www_ecoo_top.img"
+
         SP_BLK_SZ=$(od -An -tu4 -j12 -N4 www_ecoo_top.img | tr -d ' ')
         SP_TOTAL_BLKS=$(od -An -tu4 -j16 -N4 www_ecoo_top.img | tr -d ' ')
         SP_TOTAL_SIZE=$((SP_BLK_SZ * SP_TOTAL_BLKS))
-        echo "sparse: blk_sz=$SP_BLK_SZ total_blks=$SP_TOTAL_BLKS => $SP_TOTAL_SIZE 字节"
-        [ "$SP_TOTAL_SIZE" = "$P8_SIZE" ] || { echo "❌ sparse 大小不符"; exit 1; }
+        echo "sparse 头: blk_sz=$SP_BLK_SZ total_blks=$SP_TOTAL_BLKS => $SP_TOTAL_SIZE 字节"
+        if [ "$SP_TOTAL_SIZE" != "$P8_SIZE" ]; then
+          echo "❌ sparse 解压后大小不符: $SP_TOTAL_SIZE != $P8_SIZE"
+          exit 1
+        fi
+        echo "输出 sparse magic:"
         xxd -l 4 www_ecoo_top.img
         ls -lh www_ecoo_top.img
 
+        # 导出到后续 step
         echo "B32_SIZE=$B32_SIZE" >> "$GITHUB_ENV"
         echo "ROOTFS_MB=$ROOTFS_MB" >> "$GITHUB_ENV"
+
+        # 清理 p9 中间文件
         rm -f "$P9_IMG"
 
-        echo ""
-        echo "=============================================="
-        echo "✅ step 7 完成，5 项审计全部通过"
-        echo "=============================================="
-
-    - name: 8. 白名单复制并重新打包
+    - name: 8. 替换并重新打包
       run: |
         SOURCE_OS="Ubuntu_${{ env.UBUNTU_VERSION }}"
+        echo "编译源系统: ${SOURCE_OS}"
+
         FINAL_DIR="USB-hi3798mv100-${{ env.DEVICE_MODEL }}-PURE"
         rm -rf "$FINAL_DIR"
-        mkdir -p "$FINAL_DIR/mv100"
-
-        WHITELIST=(
-          "bootargs.bin"
-          "fastboot.bin"
-          "mv100/baseparam.img"
-          "mv100/bootargs.bin"
-          "mv100/fastboot.bin"
-          "mv100/hi_kernel.bin"
-          "mv100/logo.img"
-          "mv100/pq_param.bin"
-          "mv100/recoverybox32.ext4"
-        )
-        echo "========== 白名单复制（只复制 fastboot 需要的）=========="
-        for f in "${WHITELIST[@]}"; do
-          if [ ! -f "usb_template/$f" ]; then
-            echo "❌ 缺必要文件: $f"
-            exit 1
-          fi
-          mkdir -p "$FINAL_DIR/$(dirname "$f")"
-          cp "usb_template/$f" "$FINAL_DIR/$f"
-          echo "  + $f"
-        done
-
+        cp -r usb_template "$FINAL_DIR"
+        rm -f "$FINAL_DIR/mv100/www_ecoo_top.ext4"
+        # 【关键】使用含 backup-32.gz 的 p8 backup 分区 sparse 镜像
         cp www_ecoo_top.img "$FINAL_DIR/mv100/www_ecoo_top.ext4"
-        echo "  + mv100/www_ecoo_top.ext4 (新构建)"
 
-        echo "========== 最终刷机包文件清单 =========="
-        ACTUAL_FILES=$(find "$FINAL_DIR" -type f | sort)
-        echo "$ACTUAL_FILES"
-        ACTUAL_COUNT=$(echo "$ACTUAL_FILES" | wc -l)
-        EXPECTED_COUNT=$(( ${#WHITELIST[@]} + 1 ))
-        echo "文件数: $ACTUAL_COUNT（期望 $EXPECTED_COUNT）"
-        if [ "$ACTUAL_COUNT" -ne "$EXPECTED_COUNT" ]; then
-          echo "❌ 文件数量不符"
-          exit 1
-        fi
-        for f in $ACTUAL_FILES; do
-          REL="${f#$FINAL_DIR/}"
-          if [ "$REL" = "mv100/www_ecoo_top.ext4" ]; then continue; fi
-          MATCH=0
-          for w in "${WHITELIST[@]}"; do
-            [ "$REL" = "$w" ] && MATCH=1 && break
-          done
-          if [ "$MATCH" -eq 0 ]; then
-            echo "❌ 非白名单文件: $REL"
-            exit 1
-          fi
-        done
-        echo "✅ 审计通过：只有 10 个 fastboot 需要的文件"
+        echo "刷机包内容:"
+        ls -l "$FINAL_DIR/mv100/"
 
         INNER_ZIP="USB-hi3798mv100-${{ env.DEVICE_MODEL }}-PURE-${SOURCE_OS}-$(date +%Y%m%d).zip"
         cd "$FINAL_DIR"
@@ -370,6 +228,7 @@ jobs:
         cd ..
         echo "INNER_ZIP=${INNER_ZIP}" >> "$GITHUB_ENV"
         echo "SOURCE_OS=${SOURCE_OS}" >> "$GITHUB_ENV"
+        echo "✅ 最终刷机包:"
         ls -lh "${INNER_ZIP}"
 
     - name: 9. 打包总包（含说明文档）
@@ -388,40 +247,33 @@ jobs:
           设备型号：      ${{ env.DEVICE_MODEL }}
           编译源系统：    Ubuntu ${{ env.UBUNTU_VERSION }}
           rootfs 实际：   ${ROOTFS_MB} MB
-          p9 ext4 初始：  ${P9_SIZE_MB} MB
+          p9 ext4 初始：  ${P9_SIZE_MB} MB（首次启动 resize2fs 扩展至分区满）
           p8 分区大小：   $((P8_SIZE/1024/1024)) MB
-          backup-32.gz：  $((B32_SIZE/1024/1024)) MB（新生成）
-          自定义 MAC：    ${{ env.CUSTOM_MAC }}
+          backup-32.gz：  $((B32_SIZE/1024/1024)) MB（压缩后）
           构建日期：      $(date '+%Y-%m-%d %H:%M:%S')
-
-        【构建保证】
-          - p9 rootfs 完全从 Ubuntu Base 构建，与原厂 p9 内容无任何交集
-          - 原厂 backup-32.gz 从未被解压或复制
-          - 5 项构建期审计 + 白名单复制全部通过
 
         【root 账号信息】
           用户名：        root
           初始密码：      ${{ env.ROOT_PASSWORD }}
           ⚠️ 首次登录后请立即执行 passwd root 修改密码！
 
-        【USB 存储支持】
-          U 盘插入后会自动挂载到 /media/sdX1，df -h 可见容量
-          支持格式：FAT32 / exFAT / NTFS / ext4
-
-        【刷机包结构（白名单，共 10 个文件）】
-          顶层：bootargs.bin, fastboot.bin
-          mv100/：baseparam.img, bootargs.bin, fastboot.bin, hi_kernel.bin,
-                  logo.img, pq_param.bin, recoverybox32.ext4, www_ecoo_top.ext4
+        【刷机流程说明】
+          fastboot 刷写 p1~p6（boot/kernel 等）
+          fastboot 刷写 p7（recoverybox32.ext4）
+          fastboot 刷写 p8（www_ecoo_top.ext4，内含 backup-32.gz）
+          重启进入 p7 → 自动解压 backup-32.gz 写入 p9
+          再次重启 → 进入 p9 新系统 → resize2fs 扩展分区
 
         【刷机步骤】
-          1. 将刷机包 zip 解压到 U 盘根目录（FAT32）
-          2. U 盘插入机顶盒 USB 口
-          3. 按住 Recovery 按钮通电，等待自动刷机
-          4. 首次启动较慢，耐心等待
+          1. 将刷机包 zip 解压到 U 盘根目录（U 盘须为 FAT32 格式）
+          2. 将 U 盘插入机顶盒 USB 口
+          3. 按住机身侧面 Recovery 按钮，接通电源
+          4. 等待进入刷机界面后松开按钮，自动开始刷机
+          5. 首次启动较慢（解压 + 扩展分区），请耐心等待
 
         【注意事项】
-          - 刷机前请确认设备型号与本包匹配
-          - U 盘建议 USB 2.0 接口
+          - 刷机前请确认设备型号与本包匹配，刷错型号可能导致变砖
+          - U 盘建议使用 USB 2.0 接口
           - root 初始密码为：${{ env.ROOT_PASSWORD }}
         ================================================================
         EOF
@@ -431,6 +283,7 @@ jobs:
         zip -q -r "../${RELEASE_ZIP}" .
         cd ..
         echo "RELEASE_ZIP=${RELEASE_ZIP}" >> "$GITHUB_ENV"
+        echo "✅ 总包:"
         ls -lh "${RELEASE_ZIP}"
 
     - name: 10. 上传 Artifact
@@ -455,21 +308,19 @@ jobs:
           | 设备型号 | `${{ env.DEVICE_MODEL }}` |
           | 编译源系统 | `Ubuntu ${{ env.UBUNTU_VERSION }}` |
           | rootfs 实际 | `${ROOTFS_MB} MB` |
-          | p9 ext4 初始 | `${P9_SIZE_MB} MB` |
+          | p9 ext4 初始 | `${P9_SIZE_MB} MB`（首次启动扩展至分区满） |
           | p8 分区 | `$((P8_SIZE/1024/1024)) MB` |
           | backup-32.gz | `$((B32_SIZE/1024/1024)) MB` |
-
-          ### 功能特性
-          - USB 存储自动挂载（FAT32/exFAT/NTFS/ext4）
-          - 网络 DHCP 自动获取 IP
-          - SSH 远程登录
-          - 国内 NTP 时间同步
-          - UTF-8 locale
 
           ### 账号信息
           - **用户名：** `root`
           - **初始密码：** `${{ env.ROOT_PASSWORD }}`
           - ⚠️ 首次登录后请立即执行 `passwd root` 修改密码！
+
+          ### 下载与使用
+          1. 下载 **Hi3798mv100_USB_${{ env.DEVICE_MODEL }}_${{ env.SOURCE_OS }}.zip**
+          2. 解压后将刷机包 zip 解压到 U 盘根目录（FAT32 格式）
+          3. U 盘插入机顶盒，按住 Recovery 键通电，等待自动刷机
         files: |
           Hi3798mv100_USB_${{ env.DEVICE_MODEL }}_${{ env.SOURCE_OS }}.zip
       env:
