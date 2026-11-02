@@ -1,4 +1,4 @@
-name: Build Pure TTL Package
+name: 编译Hi3798mv100的ubuntu系统TTL刷机包
 
 on:
   workflow_dispatch:
