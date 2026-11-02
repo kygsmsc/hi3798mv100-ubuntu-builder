@@ -4,16 +4,16 @@
 # 修复U盘挂载后root密码失效问题--修复中文乱码--修复wifi驱动安装出错
 #
 # 本版关键修复（vs 用户上传版）：
-#   [P1] firstboot-password 改用正向判据 /etc/firstboot-pwd.txt（不再依赖 .done）
-#   [P2] 服务启动时机用 WantedBy=multi-user.target + After=local-fs.target
-#        + Before=ssh.service（保证 /etc 已 rw，chpasswd 不会静默失败）
-#   [P3] 脚本内 chpasswd 失败则保留密码文件（避免"密码没改但密码文件被删"死局）
-#   [P4] 密码读取用 printf + cat 管道（避开 bash 内建 $PWD 冲突）
-#   [P5] 移除 modules-load.d（4.4 内核模块全内建，避免 systemd-modules-load 失败）
-#   [P6] 加 system.conf.d/99-old-kernel.conf（全局关闭 ProtectProc，消除 hidepid 警告）
-#   [P7] 保留 apt lists + 99-no-translations（刷完机直接 apt install，无需先 apt update）
-#   [P8] A 级精简：删 consolefonts/keymaps/hwdb.bin（-17MB，零影响）
-#   [P9] 精简操作不做任何 apt-get remove（避免打断 systemd enable 状态）
+#   [P1] firstboot-password 正向判据 /etc/firstboot-pwd.txt
+#   [P2] WantedBy=multi-user.target + After=local-fs.target + Before=ssh.service
+#   [P3] chpasswd 失败保留密码文件重试
+#   [P4] printf + cat 管道读取密码
+#   [P5] 移除 modules-load.d（4.4 内核内建）
+#   [P6] system.conf.d/99-old-kernel.conf 消除 hidepid 警告
+#   [P7] 保留 apt lists + 99-no-translations
+#   [P8] A 级精简 consolefonts/keymaps/hwdb.bin
+#   [P9] 精简不做 apt 操作
+#   [P10] eth0 由 NetworkManager 管理（ifupdown 只处理 lo）
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 export LC_ALL=C LANG=C
@@ -45,7 +45,7 @@ DPkg::Options:: "--path-include=/usr/share/locale/en/*";
 DPkg::Options:: "--path-include=/usr/share/locale/zh_CN/*";
 LOCCONF
 
-# 跳过 DEP-11 (AppStream) 和 Translation，apt lists 只保留 Packages（省 ~15MB）
+# 跳过 DEP-11 和 Translation，apt lists 只保留 Packages
 cat > /etc/apt/apt.conf.d/99-no-translations << 'APTCONF'
 Acquire::IndexTargets::deb::DEP-11::DefaultEnabled "false";
 Acquire::IndexTargets::deb::DEP-11-icons::DefaultEnabled "false";
@@ -58,11 +58,7 @@ CODENAME="${UBUNTU_CODENAME:-focal}"
 echo "==> Ubuntu 代号: $CODENAME"
 echo "==> 软件源: $MIRROR"
 
-# ============================================================
-# APT 源格式（兼容性核心）
-#   20.04 / 22.04 → 传统 sources.list
-#   24.04 → DEB822 sources.list.d/ubuntu.sources
-# ============================================================
+# ========== APT 源格式（兼容 20.04 / 22.04 / 24.04） ==========
 if [ "$CODENAME" = "noble" ]; then
     echo "==> DEB822 格式软件源 (24.04+)"
     mkdir -p /etc/apt/sources.list.d
@@ -93,10 +89,7 @@ fi
 apt-get update -qq
 apt-get -f install -y -qq 2>&1 || true
 
-# ============================================================
-# 核心软件包
-#   包含 WiFi 依赖：file / network-manager / wpasupplicant / iw / rfkill
-# ============================================================
+# ========== 核心软件包（含 WiFi 依赖） ==========
 echo "==> 安装核心软件包"
 apt-get install -y -qq --no-install-recommends \
   systemd systemd-sysv systemd-timesyncd dbus udev \
@@ -107,10 +100,7 @@ apt-get install -y -qq --no-install-recommends \
   locales tzdata \
   file network-manager wpasupplicant iw rfkill
 
-# ============================================================
-# USB 存储支持（不写 modules-load.d）
-#   exfat 用 exfat-fuse（4.4 内核无内建，Ubuntu 20.04/22.04/24.04 均可安装）
-# ============================================================
+# ========== USB 存储支持 ==========
 echo "==> USB 存储支持"
 apt-get install -y -qq --no-install-recommends \
   util-linux usbutils \
@@ -188,19 +178,12 @@ ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
 echo "$TIMEZONE" > /etc/timezone
 dpkg-reconfigure -f noninteractive tzdata >/dev/null 2>&1 || true
 
-# ========== root 密码（构建期 chpasswd） ==========
+# ========== root 密码 ==========
 echo "==> 设置 root 密码（长度 ${#ROOT_PASSWORD} 字符）"
 echo "root:$ROOT_PASSWORD" | chpasswd
 sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
 
-# ============================================================
-# 【P1~P4】firstboot-password（正向判据防弹版）
-#   - 判据：/etc/firstboot-pwd.txt 存在（正向，不依赖 .done）
-#   - 时机：WantedBy=multi-user.target + After=local-fs.target
-#           + Before=ssh.service（保证 /etc 已 rw）
-#   - 读取：printf + cat 管道（不用 $PWD 变量，避免 bash 内建冲突）
-#   - 失败：chpasswd 失败则保留密码文件，下次启动重试
-# ============================================================
+# ========== firstboot-password（正向判据防弹版） ==========
 printf '%s\n' "$ROOT_PASSWORD" > /etc/firstboot-pwd.txt
 chmod 600 /etc/firstboot-pwd.txt
 chown root:root /etc/firstboot-pwd.txt
@@ -209,8 +192,6 @@ cat > /usr/local/sbin/firstboot-password.sh << 'SH'
 #!/bin/bash
 PWDFILE=/etc/firstboot-pwd.txt
 [ -f "$PWDFILE" ] || exit 0
-
-# 用 printf + cat 管道，避免任何特殊字符展开问题
 if { printf 'root:'; cat "$PWDFILE"; } | chpasswd; then
     chage -d "$(date +%Y-%m-%d)" root 2>/dev/null || true
     rm -f "$PWDFILE"
@@ -243,7 +224,7 @@ SVC
 systemctl enable firstboot-password.service 2>/dev/null || true
 echo "✅ firstboot-password.service 已启用（正向判据）"
 
-# ========== firstboot-apt-update（首次启动后台刷新 apt lists） ==========
+# ========== firstboot-apt-update ==========
 cat > /etc/systemd/system/firstboot-apt-update.service << 'SVC'
 [Unit]
 Description=First boot: refresh apt package lists in background
@@ -263,37 +244,88 @@ SVC
 systemctl enable firstboot-apt-update.service 2>/dev/null || true
 echo "✅ firstboot-apt-update.service 已启用"
 
-# ========== 网络配置 ==========
-echo "==> 网络配置 (eth0: ifupdown / wlan0: NetworkManager)"
-mkdir -p /etc/network/interfaces.d
-if [ -n "${CUSTOM_MAC:-}" ]; then
-  echo "自定义 eth0 MAC: $CUSTOM_MAC"
-  cat > /etc/network/interfaces.d/eth0 << ETH0
-auto eth0
-iface eth0 inet dhcp
-pre-up ifconfig eth0 hw ether $CUSTOM_MAC
-ETH0
-else
-  cat > /etc/network/interfaces.d/eth0 << ETH0
-auto eth0
-iface eth0 inet dhcp
-ETH0
-fi
-if ! grep -q 'source /etc/network/interfaces.d/\*' /etc/network/interfaces 2>/dev/null; then
-  echo 'source /etc/network/interfaces.d/*' >> /etc/network/interfaces
-fi
+# ============================================================
+# 【P10】网络配置：eth0 + wlan0 全由 NetworkManager 管理
+#
+# 关键点：
+#   1. ifupdown 只配置 lo（127.0.0.1）
+#      NM 的 ifupdown 插件看到 "auto eth0" 会拒绝管理 eth0
+#   2. NM 配置中移除 unmanaged-devices=interface-name:eth0
+#   3. 预置 eth0.nmconnection：DHCP + 可选自定义 MAC
+#   4. 保留 networking.service 启用（只处理 lo，无害）
+# ============================================================
+echo "==> 网络配置（eth0 + wlan0 全部由 NetworkManager 管理）"
 
+# 清理可能残留的 ifupdown eth0 配置
+rm -f /etc/network/interfaces.d/eth0
+mkdir -p /etc/network/interfaces.d
+
+# interfaces 只保留 lo
+cat > /etc/network/interfaces << 'NETIF'
+# Loopback
+auto lo
+iface lo inet loopback
+
+# eth0 / wlan0 全部由 NetworkManager 管理
+# 禁止在此文件或 interfaces.d 下配置 eth0，否则 NM 会忽略 eth0
+NETIF
+
+# NM 全局配置（不再排除 eth0）
 mkdir -p /etc/NetworkManager/conf.d
 cat > /etc/NetworkManager/conf.d/99-hinas.conf << 'NMCONF'
-[keyfile]
-unmanaged-devices=interface-name:eth0
-
+# 关闭 WiFi 扫描 MAC 随机化
 [device]
 wifi.scan-rand-mac-address=no
 
+# 2 = 关闭 WiFi 省电
 [connection]
 wifi.powersave = 2
 NMCONF
+
+# 预置 eth0 连接（DHCP + 可选自定义 MAC）
+mkdir -p /etc/NetworkManager/system-connections
+ETH_UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null \
+           || uuidgen 2>/dev/null \
+           || echo "8a8b4b7a-1e6d-4a6c-9b1a-1a2b3c4d5e6f")
+
+if [ -n "${CUSTOM_MAC:-}" ]; then
+  echo "==> 自定义 eth0 MAC（NM cloned-mac-address）: $CUSTOM_MAC"
+  cat > /etc/NetworkManager/system-connections/eth0.nmconnection << NMETH0
+[connection]
+id=eth0
+uuid=$ETH_UUID
+type=ethernet
+interface-name=eth0
+autoconnect=true
+
+[ethernet]
+cloned-mac-address=$CUSTOM_MAC
+
+[ipv4]
+method=auto
+
+[ipv6]
+method=auto
+NMETH0
+else
+  cat > /etc/NetworkManager/system-connections/eth0.nmconnection << NMETH0
+[connection]
+id=eth0
+uuid=$ETH_UUID
+type=ethernet
+interface-name=eth0
+autoconnect=true
+
+[ipv4]
+method=auto
+
+[ipv6]
+method=auto
+NMETH0
+fi
+chmod 600 /etc/NetworkManager/system-connections/eth0.nmconnection
+chown root:root /etc/NetworkManager/system-connections/eth0.nmconnection
+echo "✅ eth0 由 NetworkManager 管理（DHCP）"
 
 # ========== locale（含硬验证兜底） ==========
 echo "==> 生成 locale: $LOCALES"
@@ -339,7 +371,7 @@ echo "✅ locale 生成完成"
 
 systemd-machine-id-setup 2>/dev/null || true
 
-# ========== SSH 主机密钥（用正确 hostname 做 comment） ==========
+# ========== SSH 主机密钥 ==========
 rm -f /etc/ssh/ssh_host_*
 if command -v ssh-keygen >/dev/null 2>&1; then
   mkdir -p /etc/ssh
@@ -380,11 +412,7 @@ NTP=ntp.aliyun.com ntp.tencent.com cn.pool.ntp.org
 FallbackNTP=0.cn.pool.ntp.org 1.cn.pool.ntp.org 2.cn.pool.ntp.org 3.cn.pool.ntp.org
 NTP
 
-# ============================================================
-# 【P6】systemd 版本检测 + logind/system 兼容
-#   systemd 245 (20.04): 跳过
-#   systemd 249/255 (22.04/24.04): 写入 logind + system 兼容配置
-# ============================================================
+# ========== logind + system 老内核兼容 ==========
 SYSTEMD_VER=$(systemctl --version 2>/dev/null | head -1 | awk '{print $2}' | cut -d. -f1)
 if [ "${SYSTEMD_VER:-0}" -ge 247 ] 2>/dev/null; then
     echo "==> systemd $SYSTEMD_VER >= 247，写入 logind + system 兼容配置"
@@ -426,14 +454,11 @@ nameserver 223.5.5.5
 nameserver 223.6.6.6
 RESOLV
 
-# ============================================================
-# 深度清理（保留 /var/lib/apt/lists/*，配合 99-no-translations 已省 15MB）
-# ============================================================
+# ========== 深度清理 ==========
 echo "==> 深度清理"
 apt-get autoremove -y --purge
 apt-get clean
 
-# 保留 apt lists（刷完机可直接 apt install）
 rm -rf /var/tmp/* /tmp/* /root/.cache 2>/dev/null || true
 rm -rf /usr/share/doc /usr/share/man /usr/share/info \
        /usr/share/lintian /usr/share/linda /usr/share/groff 2>/dev/null || true
@@ -466,21 +491,13 @@ rm -f /var/log/*.gz /var/log/*.old /var/log/*.1 2>/dev/null || true
 rm -f /usr/bin/qemu-arm-static
 rm -f /etc/apt/apt.conf.d/99minimize /etc/apt/apt.conf.d/99locale-keep
 
-# ============================================================
-# 【P8/P9】A 级精简（零影响，纯文件删除，不涉及 apt 操作）
-#   - consolefonts: 物理 console 字体，SSH/TTL 不影响（-5MB）
-#   - keymaps:     物理 console 键盘布局（-2MB）
-#   - hwdb.bin:    udev 硬件数据库，删除后 udev 降级运行（-10MB）
-#   注意：不执行 apt-get remove eject（1MB 保留，避免打断 systemd enable 状态）
-#   注意：不删除 dpkg md5sums/triggers（避免 dpkg 状态不一致）
-# ============================================================
+# ========== A 级精简（零影响） ==========
 echo "==> 精简 A 级（零影响）"
 rm -rf /usr/share/consolefonts 2>/dev/null || true
 rm -rf /usr/share/keymaps 2>/dev/null || true
 rm -f /etc/udev/hwdb.bin 2>/dev/null || true
 echo "  ✅ 已移除 consolefonts / keymaps / hwdb.bin（~17MB）"
 
-# B 级精简（可选，MINIMAL_MODE=yes 时执行）
 if [ "${MINIMAL_MODE:-no}" = "yes" ]; then
     echo "==> 精简 B 级（纯文件删除）"
     rm -rf /usr/bin/htop 2>/dev/null || true
@@ -488,8 +505,8 @@ if [ "${MINIMAL_MODE:-no}" = "yes" ]; then
     echo "  ✅ 已移除 htop / bash-completion（~4MB）"
 fi
 
-# 精简后重新 enable 所有服务（保证符号链接存在）
-echo "==> 重新 enable firstboot 服务（保证精简后符号链接存在）"
+# 精简后重新 enable（保证 systemd 符号链接存在）
+echo "==> 重新 enable 服务"
 systemctl enable firstboot-password.service 2>/dev/null || true
 systemctl enable firstboot-apt-update.service 2>/dev/null || true
 systemctl enable ssh networking NetworkManager systemd-timesyncd systemd-resolved 2>/dev/null || true
@@ -509,11 +526,12 @@ for f in /mv100*.zip /www_raw.ext4 /backup-32.gz /sdat2img.py \
 done
 
 # ============================================================
-# 审计（含硬性 fail 检查）
+# 审计
 # ============================================================
 echo "========== rootfs 审计 =========="
 echo "--- Ubuntu 代号 ---"
 echo "$CODENAME"
+
 echo "--- APT 源 ---"
 if [ "$CODENAME" = "noble" ]; then
     cat /etc/apt/sources.list.d/ubuntu.sources
@@ -538,6 +556,42 @@ for c in file nmtui nmtui-connect nmcli iw rfkill wpa_supplicant; do
   command -v "$c" 2>/dev/null || echo "(MISSING!)"
 done
 
+# ============================================================
+# 【P10】网络管理检查（eth0 由 NM 管理）
+# ============================================================
+echo "--- 网络管理检查（eth0 → NM）---"
+echo -n "  /etc/network/interfaces.d/eth0: "
+if [ -f /etc/network/interfaces.d/eth0 ]; then
+    echo "❌ 存在（ifupdown 会抢占 eth0）"
+    exit 1
+else
+    echo "✅ 不存在"
+fi
+echo "  /etc/network/interfaces:"
+cat /etc/network/interfaces | sed 's/^/    /'
+echo -n "  NM conf 是否排除 eth0: "
+if grep -q 'unmanaged-devices=interface-name:eth0' /etc/NetworkManager/conf.d/99-hinas.conf 2>/dev/null; then
+    echo "❌ 仍排除 eth0"
+    exit 1
+else
+    echo "✅ 未排除"
+fi
+echo -n "  /etc/NetworkManager/system-connections/eth0.nmconnection: "
+if [ -f /etc/NetworkManager/system-connections/eth0.nmconnection ]; then
+    PERM=$(stat -c '%a %U:%G' /etc/NetworkManager/system-connections/eth0.nmconnection)
+    if [ "$PERM" = "600 root:root" ]; then
+        echo "✅ 存在且权限正确 (600 root:root)"
+    else
+        echo "❌ 权限异常: $PERM（NM 会拒绝加载）"
+        exit 1
+    fi
+else
+    echo "❌ 缺失"
+    exit 1
+fi
+echo "  预置连接内容:"
+sed 's/^/    /' /etc/NetworkManager/system-connections/eth0.nmconnection
+
 echo "--- firstboot-password 检查（关键）---"
 echo -n "  /etc/firstboot-pwd.txt: "
 if [ -f /etc/firstboot-pwd.txt ]; then
@@ -558,33 +612,21 @@ systemctl is-enabled firstboot-password.service 2>/dev/null || { echo "❌ 未 e
 echo "  service 的 ConditionPathExists:"
 grep '^ConditionPathExists' /etc/systemd/system/firstboot-password.service
 if grep -q '^ConditionPathExists=!' /etc/systemd/system/firstboot-password.service; then
-    echo "  ❌ 检测到反向判据（!），会导致 p7 残留 .done 拦住服务"
+    echo "  ❌ 检测到反向判据（!）"
     exit 1
 fi
-echo "  service 的 WantedBy:"
-grep '^WantedBy' /etc/systemd/system/firstboot-password.service
-echo "  service 的 After/Before:"
-grep -E '^(After|Before)=' /etc/systemd/system/firstboot-password.service
+echo "  service 的 WantedBy / After / Before:"
+grep -E '^(WantedBy|After|Before)=' /etc/systemd/system/firstboot-password.service
 
 echo "--- /etc/shadow 中 root 行（前 40 字符）---"
 grep '^root:' /etc/shadow | cut -c1-40
 if ! grep -q '^root:\$' /etc/shadow; then
-    echo "  ❌ shadow 中 root 行结构异常（无 root:\$ 前缀）"
+    echo "  ❌ shadow 中 root 行结构异常"
     exit 1
 fi
 
 echo "--- shadow/passwd 权限 ---"
 stat -c '    %A %U:%G %n' /etc/passwd /etc/shadow /etc/group /etc/gshadow
-SHADOW_PERM=$(stat -c '%a %U:%G' /etc/shadow)
-if [ "$SHADOW_PERM" != "640 root:shadow" ]; then
-    echo "  ⚠️  shadow 权限非标准：$SHADOW_PERM（将在 firstboot 时修正）"
-fi
-
-echo "--- logind / system 兼容配置 ---"
-ls /etc/systemd/logind.conf.d/ /etc/systemd/system.conf.d/ 2>/dev/null || echo "(无，旧版 systemd 跳过)"
-
-echo "--- modules-load.d（应为空）---"
-ls -la /etc/modules-load.d/ 2>/dev/null
 
 echo "--- 精简 A 级验证（应全部不存在）---"
 for p in /usr/share/consolefonts /usr/share/keymaps /etc/udev/hwdb.bin; do
@@ -600,14 +642,7 @@ for k in /etc/ssh/ssh_host_*_key.pub; do
   [ -f "$k" ] && ssh-keygen -lf "$k" 2>/dev/null
 done
 
-echo "--- rootfs 各目录体积 ---"
-for d in /usr /etc /var /opt /home /root /lib /bin /sbin /boot; do
-    if [ -e "$d" ]; then
-        sz=$(du -sh "$d" 2>/dev/null | awk '{print $1}')
-        printf '  %-8s %s\n' "$sz" "$d"
-    fi
-done
-echo "--- rootfs 总计（不含 proc/sys/dev/run/tmp）---"
+echo "--- rootfs 总计 ---"
 du -sh --exclude=/proc --exclude=/sys --exclude=/dev --exclude=/run --exclude=/tmp / 2>/dev/null | awk '{print "  " $1 "  总计"}' || true
 
 echo "========== 审计结束 =========="
