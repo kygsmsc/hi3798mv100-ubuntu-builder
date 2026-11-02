@@ -1,7 +1,7 @@
 #!/bin/bash
 # lib/rootfs_inner.sh — 在 chroot 内执行的系统配置脚本
 # 兼容 Ubuntu 20.04 (focal) / 22.04 (jammy) / 24.04 (noble)
-# 修复U盘挂载后root密码失效问题
+# 修复U盘挂载后root密码失效问题--修复中文乱码--修复wifi驱动安装出错
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 export LC_ALL=C LANG=C
@@ -12,7 +12,9 @@ mount -t tmpfs tmpfs /tmp 2>/dev/null || true
 mkdir -p /var/cache/apt/archives
 mount -t tmpfs tmpfs /var/cache/apt/archives 2>/dev/null || true
 
-# ========== APT 最小化 ==========
+# ============================================================
+# APT 最小化（保留 /usr/share/i18n/locales，供 locale-gen 使用）
+# ============================================================
 cat > /etc/apt/apt.conf.d/99minimize << 'APTCONF'
 APT::Install-Recommends "false";
 APT::Install-Suggests "false";
@@ -23,7 +25,6 @@ DPkg::Options:: "--path-exclude=/usr/share/man/*";
 DPkg::Options:: "--path-exclude=/usr/share/info/*";
 DPkg::Options:: "--path-exclude=/usr/share/lintian/*";
 DPkg::Options:: "--path-exclude=/usr/share/groff/*";
-DPkg::Options:: "--path-exclude=/usr/share/i18n/locales/*";
 APTCONF
 
 cat > /etc/apt/apt.conf.d/99locale-keep << 'LOCCONF'
@@ -36,9 +37,9 @@ CODENAME="${UBUNTU_CODENAME:-focal}"
 echo "==> Ubuntu 代号: $CODENAME"
 echo "==> 软件源: $MIRROR"
 
-# ========== 兼容性：APT 源格式 ==========
+# ========== APT 源格式 ==========
 if [ "$CODENAME" = "noble" ]; then
-    echo "==> 使用 DEB822 格式软件源 (Ubuntu 24.04+)"
+    echo "==> DEB822 格式软件源 (24.04+)"
     mkdir -p /etc/apt/sources.list.d
     cat > /etc/apt/sources.list.d/ubuntu.sources << SOURCES
 Types: deb
@@ -55,7 +56,7 @@ Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 SOURCES
     > /etc/apt/sources.list
 else
-    echo "==> 使用传统格式软件源 (Ubuntu 20.04 / 22.04)"
+    echo "==> 传统格式软件源 (20.04 / 22.04)"
     cat > /etc/apt/sources.list << SOURCES
 deb $MIRROR $CODENAME main restricted universe multiverse
 deb $MIRROR $CODENAME-updates main restricted universe multiverse
@@ -67,7 +68,13 @@ fi
 apt-get update -qq
 apt-get -f install -y -qq 2>&1 || true
 
-# ========== 安装核心软件包 ==========
+# ============================================================
+# 【改动 1】核心包列表加 file / network-manager / wpasupplicant / iw / rfkill
+#   file            → hinaswifi.sh 判断驱动包类型
+#   network-manager → 提供 nmtui / nmtui-connect / nmcli
+#   wpasupplicant   → NM 连接加密 WiFi 必需
+#   iw / rfkill     → 调试 WiFi 与解除软屏蔽
+# ============================================================
 echo "==> 安装核心软件包"
 apt-get install -y -qq --no-install-recommends \
   systemd systemd-sysv systemd-timesyncd dbus udev \
@@ -75,11 +82,10 @@ apt-get install -y -qq --no-install-recommends \
   openssh-server ssh sudo \
   e2fsprogs ca-certificates \
   vim-tiny less htop wget curl cron rsyslog bash-completion \
-  locales tzdata
+  locales tzdata \
+  file network-manager wpasupplicant iw rfkill
 
-# ============================================================
-# USB 存储支持（exfat-fuse 在所有目标版本中均可用）
-# ============================================================
+# ========== USB 存储支持 ==========
 echo "==> USB 存储支持"
 apt-get install -y -qq --no-install-recommends \
   util-linux usbutils \
@@ -138,23 +144,12 @@ case "$ACTION" in
     [ -z "$FSTYPE" ] && exit 0
     mkdir -p "$MOUNT_POINT"
     case "$FSTYPE" in
-      vfat|fat|msdos)
-        mount -t vfat -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" || true
-        ;;
-      exfat)
-        mount.exfat-fuse -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" 2>/dev/null \
-          || mount -t exfat -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" 2>/dev/null \
-          || true
-        ;;
-      ntfs)
-        mount -t ntfs-3g -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" || true
-        ;;
-      ext4|ext3|ext2)
-        mount -t "$FSTYPE" -o rw "$DEV_PATH" "$MOUNT_POINT" || true
-        ;;
-      *)
-        mount -o rw "$DEV_PATH" "$MOUNT_POINT" 2>/dev/null || true
-        ;;
+      vfat|fat|msdos) mount -t vfat -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" || true ;;
+      exfat) mount.exfat-fuse -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" 2>/dev/null \
+               || mount -t exfat -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" 2>/dev/null || true ;;
+      ntfs) mount -t ntfs-3g -o rw,uid=0,gid=0,umask=000 "$DEV_PATH" "$MOUNT_POINT" || true ;;
+      ext4|ext3|ext2) mount -t "$FSTYPE" -o rw "$DEV_PATH" "$MOUNT_POINT" || true ;;
+      *) mount -o rw "$DEV_PATH" "$MOUNT_POINT" 2>/dev/null || true ;;
     esac
     ;;
   remove)
@@ -178,21 +173,11 @@ ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
 echo "$TIMEZONE" > /etc/timezone
 dpkg-reconfigure -f noninteractive tzdata >/dev/null 2>&1 || true
 
-# ============================================================
-# 【关键修复】root 密码设置
-# 删掉 chage + sed 整段（有 bug：sed 会删掉 shadow 里 root: 前缀）
-# 只用 chpasswd，它本身就会更新 shadow 的 last change date
-# ============================================================
+# ========== root 密码 ==========
 echo "==> 设置 root 密码（长度 ${#ROOT_PASSWORD} 字符）"
 echo "root:$ROOT_PASSWORD" | chpasswd
 sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
 
-# ============================================================
-# 【新增】firstboot-password.service
-# 首次启动时强制重置 root 密码为 CI 输入的值：
-#   - 覆盖 p7 recovery 可能的密码修改
-#   - 时间戳用设备当前时间，修复 "password changed in future"
-# ============================================================
 printf '%s\n' "$ROOT_PASSWORD" > /etc/firstboot-pwd.txt
 chmod 600 /etc/firstboot-pwd.txt
 chown root:root /etc/firstboot-pwd.txt
@@ -222,15 +207,20 @@ ExecStart=/usr/local/sbin/firstboot-password.sh
 [Install]
 WantedBy=multi-user.target
 SVC
-
 systemctl enable firstboot-password.service 2>/dev/null || true
-echo "✅ firstboot-password.service 已启用（首次启动强制设置 root 密码）"
+echo "✅ firstboot-password.service 已启用"
 
-# ========== 网络配置 ==========
-echo "==> 网络配置 (DHCP)"
+# ============================================================
+# 【改动 2】网络配置
+#   - eth0 继续由 ifupdown 管理（DHCP 已验证可用）
+#   - wlan0 由 NetworkManager 管理（供 nmtui-connect 使用）
+#   - NM 显式不接管 eth0，避免与 ifupdown 冲突
+#   - 关闭 WiFi 省电、禁用扫描 MAC 随机化（连接更稳）
+# ============================================================
+echo "==> 网络配置 (eth0: ifupdown / wlan0: NetworkManager)"
 mkdir -p /etc/network/interfaces.d
 if [ -n "${CUSTOM_MAC:-}" ]; then
-  echo "自定义 MAC: $CUSTOM_MAC"
+  echo "自定义 eth0 MAC: $CUSTOM_MAC"
   cat > /etc/network/interfaces.d/eth0 << ETH0
 auto eth0
 iface eth0 inet dhcp
@@ -246,9 +236,46 @@ if ! grep -q 'source /etc/network/interfaces.d/\*' /etc/network/interfaces 2>/de
   echo 'source /etc/network/interfaces.d/*' >> /etc/network/interfaces
 fi
 
+mkdir -p /etc/NetworkManager/conf.d
+cat > /etc/NetworkManager/conf.d/99-hinas.conf << 'NMCONF'
+# eth0 交给 ifupdown，NM 不碰
+[keyfile]
+unmanaged-devices=interface-name:eth0
+
+# 关闭 WiFi 扫描 MAC 随机化（避免路由器 DHCP 每次分配新 IP）
+[device]
+wifi.scan-rand-mac-address=no
+
+# 2 = 关闭 WiFi 省电，连接更稳定
+[connection]
+wifi.powersave = 2
+NMCONF
+
 # ========== locale ==========
 echo "==> 生成 locale: $LOCALES"
-locale-gen $LOCALES >/dev/null 2>&1 || true
+cat > /etc/locale.gen << 'LGEN'
+en_US.UTF-8 UTF-8
+zh_CN.UTF-8 UTF-8
+LGEN
+
+if ! locale-gen; then
+  echo "⚠️  locale-gen 返回非 0"
+fi
+
+for _loc in en_US.UTF-8 zh_CN.UTF-8; do
+  _dir="/usr/lib/locale/$(echo "$_loc" | tr 'A-Z.' 'a-z' | sed 's/utf-8/utf8/')"
+  if [ ! -d "$_dir" ] || [ -z "$(ls -A "$_dir" 2>/dev/null)" ]; then
+    echo "❌ locale 生成失败: $_dir，尝试 localedef 兜底..."
+    mkdir -p "$_dir"
+    if ! localedef -i "$(echo "$_loc" | cut -d. -f1)" -f UTF-8 "$_loc" 2>&1; then
+      echo "❌ localedef 也失败，检查 /usr/share/i18n/locales/"
+      ls -la /usr/share/i18n/locales/ 2>&1 | head -10
+      exit 1
+    fi
+  fi
+  echo "  ✅ $_loc -> $_dir"
+done
+
 cat > /etc/default/locale << 'LOCALE'
 LANG=en_US.UTF-8
 LC_ALL=en_US.UTF-8
@@ -264,10 +291,11 @@ export LC_ALL=en_US.UTF-8
 LOCSH
 chmod +x /etc/profile.d/zz-locale.sh
 update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 >/dev/null 2>&1 || true
+echo "✅ locale 生成完成"
 
 systemd-machine-id-setup 2>/dev/null || true
 
-# ========== SSH 主机密钥（用正确 hostname 做 comment）==========
+# ========== SSH 主机密钥 ==========
 rm -f /etc/ssh/ssh_host_*
 if command -v ssh-keygen >/dev/null 2>&1; then
   mkdir -p /etc/ssh
@@ -277,13 +305,34 @@ if command -v ssh-keygen >/dev/null 2>&1; then
   done
 fi
 
-# ========== 服务优化 ==========
+# ============================================================
+# 【改动 3】服务优化：启用 NM + rfkill unblock
+# ============================================================
 echo "==> 服务优化"
 systemctl enable ssh networking systemd-timesyncd systemd-resolved 2>/dev/null || true
+systemctl enable NetworkManager NetworkManager-dispatcher 2>/dev/null || true
 systemctl mask motd-news.timer motd-news.service 2>/dev/null || true
 systemctl mask apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
 systemctl mask dpkg-db-backup.timer 2>/dev/null || true
+# 装 NM 可能重新启用 networkd-dispatcher，重新 mask
+systemctl mask networkd-dispatcher 2>/dev/null || true
 systemctl set-default multi-user.target 2>/dev/null || true
+
+# 开机解除 WiFi 软屏蔽（rfkill）
+cat > /etc/systemd/system/rfkill-unblock-wifi.service << 'SVC'
+[Unit]
+Description=Unblock WiFi via rfkill
+Before=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/rfkill unblock wifi
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+SVC
+systemctl enable rfkill-unblock-wifi.service 2>/dev/null || true
 
 cat > /etc/systemd/timesyncd.conf << 'NTP'
 [Time]
@@ -291,18 +340,14 @@ NTP=ntp.aliyun.com ntp.tencent.com cn.pool.ntp.org
 FallbackNTP=0.cn.pool.ntp.org 1.cn.pool.ntp.org 2.cn.pool.ntp.org 3.cn.pool.ntp.org
 NTP
 
-# ========== 兼容性：logind 选项仅 systemd >= 247 支持 ==========
 SYSTEMD_VER=$(systemctl --version 2>/dev/null | head -1 | awk '{print $2}' | cut -d. -f1)
 if [ "${SYSTEMD_VER:-0}" -ge 247 ] 2>/dev/null; then
-    echo "==> systemd $SYSTEMD_VER >= 247，写入 logind 兼容配置"
     mkdir -p /etc/systemd/logind.conf.d
     cat > /etc/systemd/logind.conf.d/99-old-kernel.conf << 'LOGIND'
 [Login]
 ProtectProc=default
 ProcSubset=all
 LOGIND
-else
-    echo "==> systemd ${SYSTEMD_VER:-未知} < 247，跳过 logind 兼容配置"
 fi
 
 mkdir -p /etc/systemd/resolved.conf.d
@@ -342,7 +387,7 @@ find /usr/lib -name '*.pyc' -delete 2>/dev/null || true
 
 if [ -d /usr/share/bash-completion/completions ]; then
   cd /usr/share/bash-completion/completions
-  _KEEP="apt apt-get apt-cache dpkg ssh scp systemctl journalctl hostname ip curl wget less vim htop"
+  _KEEP="apt apt-get apt-cache dpkg ssh scp systemctl journalctl hostname ip curl wget less vim htop nmcli"
   for _f in *; do
     _keep=0
     for _k in $_KEEP; do
@@ -376,6 +421,9 @@ for f in /mv100*.zip /www_raw.ext4 /backup-32.gz /sdat2img.py \
   rm -f "$f" 2>/dev/null || true
 done
 
+# ============================================================
+# 【改动 4】审计段：确认 WiFi 相关命令存在
+# ============================================================
 echo "========== rootfs 审计 =========="
 echo "--- Ubuntu 代号 ---"
 echo "$CODENAME"
@@ -391,6 +439,21 @@ echo "--- /tmp ---"
 ls -la /tmp/ 2>/dev/null || echo "(empty)"
 echo "--- /home ---"
 ls -la /home/
+echo "--- locale 数据 ---"
+ls /usr/lib/locale/ 2>/dev/null
+echo "--- locale 源数据 ---"
+ls /usr/share/i18n/locales/ 2>/dev/null | head -5
+echo "--- WiFi / NM 命令检查 ---"
+for c in file nmtui nmtui-connect nmcli iw rfkill wpa_supplicant; do
+  printf '  %-18s ' "$c"
+  command -v "$c" 2>/dev/null || echo "(MISSING!)"
+done
+echo "--- NetworkManager 配置 ---"
+ls -la /etc/NetworkManager/conf.d/ 2>/dev/null
+cat /etc/NetworkManager/conf.d/99-hinas.conf 2>/dev/null
+echo "--- NetworkManager 服务 ---"
+systemctl is-enabled NetworkManager 2>/dev/null || true
+systemctl is-enabled rfkill-unblock-wifi.service 2>/dev/null || true
 echo "--- USB 支持文件 ---"
 ls -la /usr/local/sbin/usb-mount.sh \
        /etc/udev/rules.d/99-usb-storage-mount.rules \
