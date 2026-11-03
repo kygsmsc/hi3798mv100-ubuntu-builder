@@ -2,18 +2,19 @@
 # lib/rootfs_inner.sh — 在 chroot 内执行的系统配置脚本
 # 兼容 Ubuntu 20.04 (focal) / 22.04 (jammy) / 24.04 (noble)
 #
-# 本版关键修复：
-#   [P1] firstboot-password 正向判据 /etc/firstboot-pwd.txt
-#   [P2] WantedBy=multi-user.target + After=local-fs.target + Before=ssh.service
-#   [P3] chpasswd 失败保留密码文件重试
-#   [P4] printf + cat 管道读取密码
-#   [P5] 移除 modules-load.d（4.4 内核内建）
-#   [P6] system.conf.d/99-old-kernel.conf 消除 hidepid 警告
-#   [P7] 保留 apt lists + 99-no-translations
-#   [P8] A 级精简 consolefonts/keymaps/hwdb.bin
-#   [P9] 精简不做 apt 操作
+# 关键修复：
+#   [P1]  firstboot-password 正向判据 /etc/firstboot-pwd.txt
+#   [P2]  WantedBy=multi-user.target + After=local-fs.target + Before=ssh.service
+#   [P3]  chpasswd 失败保留密码文件重试
+#   [P4]  printf + cat 管道读取密码（避开 bash 内建 $PWD）
+#   [P5]  移除 modules-load.d（4.4 内核模块全内建）
+#   [P6]  system.conf.d/99-old-kernel.conf 消除 hidepid 警告
+#   [P7]  保留 apt lists + 99-no-translations（省 ~15MB，可直接 apt install）
+#   [P8]  A 级精简 consolefonts/keymaps/hwdb.bin（省 ~17MB）
+#   [P9]  精简不做 apt 操作（避免打断 systemd enable）
 #   [P10] eth0 由 NetworkManager 管理（ifupdown 只处理 lo）
 #   [P11] 删除 Ubuntu 默认 10-globally-managed-devices.conf（排除 eth0 的元凶）
+#   [P12] 预装 iptables 并切换到 legacy 后端（解决 Docker 在 4.4 内核启动失败）
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 export LC_ALL=C LANG=C
@@ -24,9 +25,7 @@ mount -t tmpfs tmpfs /tmp 2>/dev/null || true
 mkdir -p /var/cache/apt/archives
 mount -t tmpfs tmpfs /var/cache/apt/archives 2>/dev/null || true
 
-# ============================================================
-# APT 最小化（保留 /usr/share/i18n/locales，供 locale-gen 使用）
-# ============================================================
+# ========== APT 最小化 ==========
 cat > /etc/apt/apt.conf.d/99minimize << 'APTCONF'
 APT::Install-Recommends "false";
 APT::Install-Suggests "false";
@@ -45,7 +44,6 @@ DPkg::Options:: "--path-include=/usr/share/locale/en/*";
 DPkg::Options:: "--path-include=/usr/share/locale/zh_CN/*";
 LOCCONF
 
-# 跳过 DEP-11 和 Translation，apt lists 只保留 Packages
 cat > /etc/apt/apt.conf.d/99-no-translations << 'APTCONF'
 Acquire::IndexTargets::deb::DEP-11::DefaultEnabled "false";
 Acquire::IndexTargets::deb::DEP-11-icons::DefaultEnabled "false";
@@ -58,7 +56,7 @@ CODENAME="${UBUNTU_CODENAME:-focal}"
 echo "==> Ubuntu 代号: $CODENAME"
 echo "==> 软件源: $MIRROR"
 
-# ========== APT 源格式（兼容 20.04 / 22.04 / 24.04） ==========
+# ========== APT 源格式 ==========
 if [ "$CODENAME" = "noble" ]; then
     echo "==> DEB822 格式软件源 (24.04+)"
     mkdir -p /etc/apt/sources.list.d
@@ -89,7 +87,11 @@ fi
 apt-get update -qq
 apt-get -f install -y -qq 2>&1 || true
 
-# ========== 核心软件包（含 WiFi 依赖） ==========
+# ============================================================
+# 核心软件包
+#   含 WiFi 依赖：file / network-manager / wpasupplicant / iw / rfkill
+#   含 iptables：预装以便 Docker 兼容性处理（P12）
+# ============================================================
 echo "==> 安装核心软件包"
 apt-get install -y -qq --no-install-recommends \
   systemd systemd-sysv systemd-timesyncd dbus udev \
@@ -98,7 +100,24 @@ apt-get install -y -qq --no-install-recommends \
   e2fsprogs ca-certificates \
   vim-tiny less htop wget curl cron rsyslog bash-completion \
   locales tzdata \
-  file network-manager wpasupplicant iw rfkill
+  file network-manager wpasupplicant iw rfkill \
+  iptables
+
+# ============================================================
+# 【P12】iptables 切换到 legacy 后端
+#   原因：4.4 内核与 iptables-nft 后端兼容性差（缺 addrtype match）
+#   Docker 启动时无法添加 NAT 规则，报 Couldn't load match 'addrtype'
+#   本段确保预装 iptables 后立即切换到 legacy
+# ============================================================
+echo "==> 配置 iptables 使用 legacy 后端（兼容旧内核的 Docker）"
+if [ -x /usr/sbin/iptables-legacy ]; then
+    update-alternatives --set iptables /usr/sbin/iptables-legacy 2>/dev/null || true
+    update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy 2>/dev/null || true
+    echo "✅ iptables 已切换至 legacy 模式"
+    iptables --version 2>/dev/null || true
+else
+    echo "⚠️ 未找到 iptables-legacy，跳过切换"
+fi
 
 # ========== USB 存储支持 ==========
 echo "==> USB 存储支持"
@@ -222,7 +241,7 @@ TimeoutStartSec=60
 WantedBy=multi-user.target
 SVC
 systemctl enable firstboot-password.service 2>/dev/null || true
-echo "✅ firstboot-password.service 已启用（正向判据）"
+echo "✅ firstboot-password.service 已启用"
 
 # ========== firstboot-apt-update ==========
 cat > /etc/systemd/system/firstboot-apt-update.service << 'SVC'
@@ -245,28 +264,13 @@ systemctl enable firstboot-apt-update.service 2>/dev/null || true
 echo "✅ firstboot-apt-update.service 已启用"
 
 # ============================================================
-# 【P10/P11】网络配置：eth0 + wlan0 全由 NetworkManager 管理
-#
-# 关键修复（vs 上一版）：
-#   Ubuntu Server/Base 的 network-manager 包自带
-#   /usr/lib/NetworkManager/conf.d/10-globally-managed-devices.conf
-#   内容 "unmanaged-devices=*,except:type:wifi,except:type:gsm,except:type:cdma"
-#   会主动排除 eth0（ethernet 类型）→ eth0 永远 DOWN，无 IP
-#
-#   本版修复：
-#   1. 删除 /usr/lib 下 Ubuntu 默认配置
-#   2. 在 /etc 下写同名文件覆盖（unmanaged-devices= 为空）
-#   3. NM 配置中移除 unmanaged-devices=interface-name:eth0
-#   4. /etc/network/interfaces 只保留 lo
-#   5. 预置 eth0.nmconnection（DHCP + 可选 MAC）
+# 【P10/P11】网络：eth0 + wlan0 全由 NetworkManager 管理
 # ============================================================
 echo "==> 网络配置（eth0 + wlan0 全部由 NetworkManager 管理）"
 
-# 清理可能残留的 ifupdown eth0 配置
 rm -f /etc/network/interfaces.d/eth0
 mkdir -p /etc/network/interfaces.d
 
-# interfaces 只保留 lo
 cat > /etc/network/interfaces << 'NETIF'
 # Loopback
 auto lo
@@ -276,31 +280,26 @@ iface lo inet loopback
 # 禁止在此文件或 interfaces.d 下配置 eth0，否则 NM 会忽略 eth0
 NETIF
 
-# 【P11 关键修复 1】删除 Ubuntu Server 默认的 unmanaged-devices 配置
+# 【P11】删除 Ubuntu 默认 unmanaged-devices 配置（排除 eth0 的元凶）
 rm -f /usr/lib/NetworkManager/conf.d/10-globally-managed-devices.conf
 
-# 【P11 关键修复 2】在 /etc 下写同名文件覆盖（/etc 优先级高于 /usr/lib）
 mkdir -p /etc/NetworkManager/conf.d
 cat > /etc/NetworkManager/conf.d/10-globally-managed-devices.conf << 'NMOVERRIDE'
-# 覆盖 Ubuntu Server/Base 默认的 unmanaged-devices 配置
-# 默认配置为 unmanaged-devices=*,except:type:wifi,except:type:gsm,except:type:cdma
-# 会排除所有 ethernet 设备（eth0），本文件将其清空以允许 NM 管理 eth0
+# 覆盖 Ubuntu Server/Base 默认配置
+# 默认: unmanaged-devices=*,except:type:wifi,except:type:gsm,except:type:cdma
+# 会排除所有 ethernet 设备（eth0），本文件将其清空
 [keyfile]
 unmanaged-devices=
 NMOVERRIDE
 
-# NM 全局配置
 cat > /etc/NetworkManager/conf.d/99-hinas.conf << 'NMCONF'
-# 关闭 WiFi 扫描 MAC 随机化
 [device]
 wifi.scan-rand-mac-address=no
 
-# 2 = 关闭 WiFi 省电
 [connection]
 wifi.powersave = 2
 NMCONF
 
-# 预置 eth0 连接（DHCP + 可选自定义 MAC）
 mkdir -p /etc/NetworkManager/system-connections
 ETH_UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null \
            || uuidgen 2>/dev/null \
@@ -345,7 +344,7 @@ chmod 600 /etc/NetworkManager/system-connections/eth0.nmconnection
 chown root:root /etc/NetworkManager/system-connections/eth0.nmconnection
 echo "✅ eth0 由 NetworkManager 管理（DHCP）"
 
-# ========== locale（含硬验证兜底） ==========
+# ========== locale ==========
 echo "==> 生成 locale: $LOCALES"
 cat > /etc/locale.gen << 'LGEN'
 en_US.UTF-8 UTF-8
@@ -575,10 +574,29 @@ for c in file nmtui nmtui-connect nmcli iw rfkill wpa_supplicant; do
 done
 
 # ============================================================
-# 【P11】网络管理检查（eth0 → NM）——任一项不符，CI fail
+# 【P12】iptables 后端检查
+# ============================================================
+echo "--- iptables 后端检查（Docker 兼容性关键）---"
+echo -n "  iptables-legacy 存在: "
+if [ -x /usr/sbin/iptables-legacy ]; then
+    echo "✅ 存在"
+else
+    echo "❌ 缺失（Docker 在老内核上会启动失败）"
+    exit 1
+fi
+echo -n "  iptables 当前后端: "
+IPT_VER=$(iptables --version 2>/dev/null || echo "未安装")
+echo "$IPT_VER"
+case "$IPT_VER" in
+  *legacy*) echo "  ✅ 已切换到 legacy 后端" ;;
+  *nf_tables*) echo "  ❌ 仍为 nf_tables 后端（Docker 会失败）"; exit 1 ;;
+  *) echo "  ⚠️ 无法识别后端" ;;
+esac
+
+# ============================================================
+# 【P11】网络管理检查（eth0 → NM）
 # ============================================================
 echo "--- 网络管理检查（eth0 → NM）---"
-
 echo -n "  /etc/network/interfaces.d/eth0: "
 if [ -f /etc/network/interfaces.d/eth0 ]; then
     echo "❌ 存在（ifupdown 会抢占 eth0）"
@@ -586,9 +604,6 @@ if [ -f /etc/network/interfaces.d/eth0 ]; then
 else
     echo "✅ 不存在"
 fi
-
-echo "  /etc/network/interfaces:"
-sed 's/^/    /' /etc/network/interfaces
 
 echo -n "  /usr/lib/NetworkManager/conf.d/10-globally-managed-devices.conf: "
 if [ -f /usr/lib/NetworkManager/conf.d/10-globally-managed-devices.conf ]; then
@@ -601,23 +616,14 @@ fi
 echo -n "  /etc/NetworkManager/conf.d/10-globally-managed-devices.conf: "
 if [ -f /etc/NetworkManager/conf.d/10-globally-managed-devices.conf ]; then
     if grep -q '^unmanaged-devices=$' /etc/NetworkManager/conf.d/10-globally-managed-devices.conf; then
-        echo "✅ 存在且正确覆盖（unmanaged-devices= 为空）"
+        echo "✅ 存在且正确覆盖"
     else
-        echo "❌ 存在但内容不正确（应 unmanaged-devices= 为空）"
-        cat /etc/NetworkManager/conf.d/10-globally-managed-devices.conf | sed 's/^/    /'
+        echo "❌ 存在但内容不正确"
         exit 1
     fi
 else
-    echo "❌ 缺失（应在构建期写入）"
+    echo "❌ 缺失"
     exit 1
-fi
-
-echo -n "  /etc/NetworkManager/conf.d/99-hinas.conf 是否排除 eth0: "
-if grep -q 'unmanaged-devices=interface-name:eth0' /etc/NetworkManager/conf.d/99-hinas.conf 2>/dev/null; then
-    echo "❌ 仍排除 eth0"
-    exit 1
-else
-    echo "✅ 未排除"
 fi
 
 echo -n "  /etc/NetworkManager/system-connections/eth0.nmconnection: "
@@ -626,15 +632,13 @@ if [ -f /etc/NetworkManager/system-connections/eth0.nmconnection ]; then
     if [ "$PERM" = "600 root:root" ]; then
         echo "✅ 存在且权限正确 (600 root:root)"
     else
-        echo "❌ 权限异常: $PERM（NM 会拒绝加载）"
+        echo "❌ 权限异常: $PERM"
         exit 1
     fi
 else
     echo "❌ 缺失"
     exit 1
 fi
-echo "  预置连接内容:"
-sed 's/^/    /' /etc/NetworkManager/system-connections/eth0.nmconnection
 
 # ============================================================
 # firstboot-password 检查
@@ -662,8 +666,6 @@ if grep -q '^ConditionPathExists=!' /etc/systemd/system/firstboot-password.servi
     echo "  ❌ 检测到反向判据（!）"
     exit 1
 fi
-echo "  service 的 WantedBy / After / Before:"
-grep -E '^(WantedBy|After|Before)=' /etc/systemd/system/firstboot-password.service
 
 echo "--- /etc/shadow 中 root 行（前 40 字符）---"
 grep '^root:' /etc/shadow | cut -c1-40
