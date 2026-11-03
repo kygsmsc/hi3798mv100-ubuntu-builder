@@ -14,7 +14,6 @@
 #   LOCALES         生成的 locale（空格分隔）     （默认 en_US.UTF-8 zh_CN.UTF-8）
 #   ROOTFS_DIR      输出目录                      （默认 ./pure_rootfs 或 ./usb_pure_rootfs）
 # ============================================================
-
 set -euo pipefail
 
 MODE="${MODE:?请通过 build_rootfs.sh (ttl) 或 build_usb_rootfs.sh (usb) 调用}"
