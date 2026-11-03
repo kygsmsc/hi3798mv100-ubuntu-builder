@@ -13,11 +13,11 @@ on:
       base_version:
         description: 'Ubuntu Base 版本号（如 20.04.5 / 22.04.5 / 24.04.5）'
         required: false
-        default: '22.04.5'
+        default: '20.04.5'
       base_url:
         description: 'Ubuntu Base 下载目录'
         required: false
-        default: 'https://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release'
+        default: 'https://cdimage.ubuntu.com/ubuntu-base/releases/20.04/release'
       mirror:
         description: 'apt 软件源镜像'
         required: false
@@ -29,16 +29,16 @@ on:
       p9_size_mb:
         description: 'p9 rootfs ext4 初始大小（MB）。原厂约 828MB，默认 1024MB 留冗余'
         required: false
-        default: '512'
+        default: '1024'
       custom_mac:
         description: '自定义 eth0 MAC（留空则用设备原生。多设备场景每台设不同值）'
         required: false
         default: ''
-      # 【新增】精简 B 级开关
       minimal_mode:
         description: '精简 B 级（yes = 额外移除 htop/bash-completion，省 ~4MB）'
         required: false
         default: 'no'
+  
 
 concurrency:
   group: build-usb-${{ github.ref }}
@@ -61,7 +61,6 @@ jobs:
       ROOT_PASSWORD: ${{ inputs.root_password || 'root123' }}
       P9_SIZE_MB: ${{ inputs.p9_size_mb || '1024' }}
       CUSTOM_MAC: ${{ inputs.custom_mac || '' }}
-      # 【新增】精简 B 级开关（传给 common.sh → rootfs_inner.sh）
       MINIMAL_MODE: ${{ inputs.minimal_mode || 'no' }}
 
     steps:
@@ -394,6 +393,7 @@ jobs:
           - p9 rootfs 完全从 Ubuntu Base 构建，与原厂 p9 内容无任何交集
           - 原厂 backup-32.gz 从未被解压或复制
           - 5 项构建期审计 + 白名单复制全部通过
+          - iptables 已切换 legacy 后端（Docker 兼容）
 
         【root 账号信息】
           用户名：        root
@@ -403,6 +403,14 @@ jobs:
         【USB 存储支持】
           U 盘插入后会自动挂载到 /media/sdX1，df -h 可见容量
           支持格式：FAT32 / exFAT / NTFS / ext4
+
+        【网络】
+          eth0 + wlan0 全部由 NetworkManager 管理
+          nmcli device status 查看；nmcli connection show 查看连接
+
+        【Docker 支持】
+          iptables 已预配置为 legacy 后端，兼容 Linux 4.4 内核
+          刷完机可直接 apt install docker.io
 
         【刷机包结构（白名单，共 10 个文件）】
           顶层：bootargs.bin, fastboot.bin
@@ -459,11 +467,13 @@ jobs:
           ### 功能特性
           - USB 存储自动挂载（FAT32/exFAT/NTFS/ext4）
           - WiFi 支持（NetworkManager + wpasupplicant + iw + rfkill）
+          - eth0 + wlan0 全部由 NetworkManager 管理
           - 网络 DHCP 自动获取 IP
           - SSH 远程登录
           - 国内 NTP 时间同步
           - UTF-8 locale
-          - apt lists 保留（刷完机可直接 apt install，无需先 apt update）
+          - apt lists 保留（刷完机可直接 apt install）
+          - iptables legacy 后端（Docker 兼容 4.4 内核）
           - A 级精简（已移除 consolefonts/keymaps/hwdb.bin，省 ~17MB）
 
           ### 账号信息
